@@ -1,0 +1,1 @@
+"""Play 2 engines against each other and report the results."""
