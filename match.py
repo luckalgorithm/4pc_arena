@@ -1014,6 +1014,150 @@ def atomic_json(path: Path, payload: Any) -> None:
     temp.replace(path)
 
 
+def pgn4_escape(value: str) -> str:
+    return value.replace("\\", "\\\\").replace('"', '\\"')
+
+
+def pgn4_move(move: str) -> str:
+    if len(move) == 1 or "-" in move:
+        return move
+    castle = move.upper()
+    if castle in {"OO", "OOO", "O-O", "O-O-O"}:
+        return "O-O-O" if castle.replace("-", "") == "OOO" else "O-O"
+    match = re.fullmatch(
+        r"([a-z]+\d+)([a-z]+\d+)(?:=?([nbrqk]))?",
+        move.lower(),
+    )
+    if match is None:
+        return move
+    source, target, promotion = match.groups()
+    suffix = f"={promotion.upper()}" if promotion else ""
+    return f"{source}-{target}{suffix}"
+
+
+def pgn4_time_control(config: MatchConfig) -> str:
+    if config.limit_kind == "clock":
+        return f"{config.base_time_ms // 60000}+{config.increment_ms // 1000}"
+    if config.limit_kind == "movetime":
+        return f"0+{config.limit_value // 1000}"
+    return "0+0"
+
+
+def pgn4_result(result: str) -> str:
+    return {
+        "ry_win": "1-0",
+        "bg_win": "0-1",
+        "draw": "1/2-1/2",
+    }.get(result, "*")
+
+
+def pgn4_termination(record: dict[str, Any]) -> str | None:
+    termination = str(record.get("termination", ""))
+    labels = {
+        "max_plies": "Draw due to max moves reached",
+        "no_legal_moves": "Draw due to no legal moves",
+        "runner_error": "Runner error",
+    }
+    if termination in labels:
+        return labels[termination]
+    if termination.endswith("_illegal_move"):
+        return "Illegal move"
+    if termination.endswith("_time_loss"):
+        return "Loss on time"
+    if termination.endswith("_timeout"):
+        return "Engine timeout"
+    return None
+
+
+def pgn4_terminal_marker(record: dict[str, Any]) -> str | None:
+    result = str(record.get("result", ""))
+    termination = str(record.get("termination", ""))
+    if result == "draw":
+        return "D" if termination == "max_plies" else "S"
+    if result in {"ry_win", "bg_win"}:
+        if termination.endswith("_time_loss") or termination.endswith("_timeout"):
+            return "T"
+        return "#"
+    return None
+
+
+def pgn4_engine_names(
+    record: dict[str, Any],
+    engine1_name: str,
+    engine2_name: str,
+) -> tuple[str, str]:
+    names = record.get("engine_names")
+    if isinstance(names, dict):
+        engine1_name = str(names.get("engine1", engine1_name))
+        engine2_name = str(names.get("engine2", engine2_name))
+    if record.get("engine1_team") == "ry":
+        return engine1_name, engine2_name
+    return engine2_name, engine1_name
+
+
+def serialize_pgn4_game(
+    record: dict[str, Any],
+    config: MatchConfig,
+    engine1_name: str,
+    engine2_name: str,
+) -> str:
+    red_name, blue_name = pgn4_engine_names(record, engine1_name, engine2_name)
+    result = pgn4_result(str(record.get("result", "")))
+    lines = [
+        '[Variant "Teams"]',
+        '[RuleVariants "EnPassant"]',
+        f'[TimeControl "{pgn4_time_control(config)}"]',
+        f'[Red "{pgn4_escape(red_name)}"]',
+        f'[Blue "{pgn4_escape(blue_name)}"]',
+        f'[Result "{result}"]',
+    ]
+    termination = pgn4_termination(record)
+    if termination is not None:
+        lines.append(f'[Termination "{pgn4_escape(termination)}"]')
+    fen = record.get("fen")
+    if fen:
+        lines.append(f'[StartFen4 "{pgn4_escape(str(fen))}"]')
+
+    moves = [str(move) for move in record.get("moves", [])]
+    marker = pgn4_terminal_marker(record)
+    if marker is not None:
+        moves.append(marker)
+    first_player = fen_turn_index(str(fen) if fen else None)
+    move_lines: list[str] = []
+    for index, move in enumerate(moves):
+        shifted = index + first_player
+        formatted = pgn4_move(move)
+        if shifted % 4 == 0 or index == 0:
+            move_lines.append(f"{shifted // 4 + 1}. {formatted}")
+        else:
+            move_lines[-1] += f" .. {formatted}"
+    return "\n".join(lines + [""] + move_lines) + "\n\n"
+
+
+def write_pgn4(
+    path: Path,
+    records: list[dict[str, Any]],
+    config: MatchConfig,
+    engine1_name: str,
+    engine2_name: str,
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    ordered = sorted(
+        records,
+        key=lambda record: (
+            int(record.get("pair", 0)),
+            0 if record.get("engine1_team") == "ry" else 1,
+        ),
+    )
+    text = "".join(
+        serialize_pgn4_game(record, config, engine1_name, engine2_name)
+        for record in ordered
+    )
+    temp = path.with_suffix(path.suffix + ".tmp")
+    temp.write_text(text, encoding="utf-8")
+    temp.replace(path)
+
+
 def sidecar(path: Path, suffix: str) -> Path:
     return path.with_name(path.name + suffix)
 
@@ -1212,6 +1356,7 @@ def run_match(args: argparse.Namespace) -> int:
         validate_engine(config, label)
 
     out = Path(args.out).resolve() if args.out else None
+    pgn4 = Path(args.pgn4).resolve() if args.pgn4 else None
     config = MatchConfig(
         engine1,
         engine2,
@@ -1286,6 +1431,8 @@ def run_match(args: argparse.Namespace) -> int:
     else:
         name1 = probe_engine_name(engine1, "engine1-probe")
         name2 = probe_engine_name(engine2, "engine2-probe")
+    if pgn4 is not None:
+        write_pgn4(pgn4, list(records_by_id.values()), config, name1, name2)
     print_start_banner(config, args.pairs * 2, name1, name2)
     tasks = build_tasks(starts, records_by_id)
 
@@ -1304,6 +1451,14 @@ def run_match(args: argparse.Namespace) -> int:
         summary["engine2_name"] = current_name2
         if summary_path is not None:
             atomic_json(summary_path, summary)
+        if pgn4 is not None:
+            write_pgn4(
+                pgn4,
+                current_records,
+                config,
+                current_name1,
+                current_name2,
+            )
         if not args.quiet:
             print_summary(summary, current_name1, current_name2, record)
 
@@ -1387,6 +1542,14 @@ def build_parser() -> argparse.ArgumentParser:
         "--out",
         default="",
         help="optional JSONL output path; enables persistence and resume",
+    )
+    parser.add_argument(
+        "--pgn4",
+        nargs="?",
+        const="games.pgn4",
+        default="",
+        metavar="PATH",
+        help="save Chess.com-style PGN4; default path: games.pgn4",
     )
     parser.add_argument("--moves", "--pmoves", action="store_true", help="show move search data")
     parser.add_argument("--quiet", action="store_true", help="only print the final result")
