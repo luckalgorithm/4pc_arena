@@ -1484,7 +1484,7 @@ def build_parser() -> argparse.ArgumentParser:
     games = parser.add_mutually_exclusive_group()
     games.add_argument("--pairs", type=int, help="paired openings; two games each")
     games.add_argument("--games", type=int, help="total games; must be even")
-    parser.add_argument("--workers", type=int, default=max(1, min(4, os.cpu_count() or 1)))
+    parser.add_argument("--workers", type=int, default=1)
     limit = parser.add_mutually_exclusive_group()
     limit.add_argument("--nodes", type=int)
     limit.add_argument("--depth", type=int)
