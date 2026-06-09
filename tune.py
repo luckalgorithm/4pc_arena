@@ -143,6 +143,73 @@ def load_fixed(paths: list[str]) -> dict[str, int]:
     return values
 
 
+def validate_manifest_against_engine(
+    args: argparse.Namespace,
+    specs: list[dict[str, Any]],
+    fixed: dict[str, int],
+) -> str:
+    base_options = match_runner.load_options(args.engine_options, args.engine_option)
+    config = engine_config(
+        args.engine,
+        base_options,
+        hash_mb=args.hash,
+        threads=args.threads,
+    )
+    match_runner.validate_engine(config, "Engine")
+    engine_name, uci_options = match_runner.probe_engine_options(config)
+    errors: list[str] = []
+
+    for spec in specs:
+        name = str(spec["name"])
+        option = uci_options.get(name)
+        if option is None:
+            errors.append(f"{name}: not advertised by the engine")
+            continue
+        if option.type != "spin":
+            errors.append(
+                f"{name}: manifest parameters must be UCI spin options, "
+                f"but engine reports {option.type}"
+            )
+            continue
+        if option.min is None or option.max is None:
+            errors.append(f"{name}: engine did not advertise numeric bounds")
+            continue
+        if int(spec["min"]) < option.min:
+            errors.append(
+                f"{name}: manifest min {spec['min']} is below engine min {option.min}"
+            )
+        if int(spec["max"]) > option.max:
+            errors.append(
+                f"{name}: manifest max {spec['max']} is above engine max {option.max}"
+            )
+        if not option.min <= int(spec["default"]) <= option.max:
+            errors.append(
+                f"{name}: manifest default {spec['default']} is outside engine "
+                f"range [{option.min}, {option.max}]"
+            )
+
+    for name, value in fixed.items():
+        option = uci_options.get(name)
+        if option is None:
+            errors.append(f"fixed option {name}: not advertised by the engine")
+        elif option.type == "spin" and (
+            option.min is None
+            or option.max is None
+            or not option.min <= value <= option.max
+        ):
+            errors.append(
+                f"fixed option {name}: value {value} is outside engine range "
+                f"[{option.min}, {option.max}]"
+            )
+
+    if errors:
+        details = "\n  ".join(errors)
+        raise ValueError(
+            f"Parameter manifest is incompatible with {engine_name}:\n  {details}"
+        )
+    return engine_name
+
+
 def initial_values(
     specs: list[dict[str, Any]],
     initial_path: str,
@@ -439,6 +506,11 @@ def command_spsa(args: argparse.Namespace) -> None:
     specs = load_specs(spec_paths)
     selected = select_specs(specs, args.group)
     fixed = load_fixed(args.fixed)
+    engine_name = validate_manifest_against_engine(args, specs, fixed)
+    print(
+        f"Validated {len(specs)} parameter(s) against {engine_name}.",
+        flush=True,
+    )
     selected = [spec for spec in selected if str(spec["name"]) not in fixed]
     if not selected:
         raise ValueError("All selected parameters are fixed")

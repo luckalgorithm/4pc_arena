@@ -12,6 +12,7 @@ import math
 import os
 import queue
 import random
+import re
 import subprocess
 import sys
 import threading
@@ -91,6 +92,15 @@ class SearchResult:
     result: str | None = None
 
 
+@dataclass(frozen=True)
+class UciOption:
+    name: str
+    type: str
+    default: str | None
+    min: int | None
+    max: int | None
+
+
 @dataclass
 class MatchResult:
     records: list[dict[str, Any]]
@@ -139,6 +149,7 @@ class UciEngine:
         self.config = config
         self.label = label
         self.name = config.path.name
+        self.uci_options: dict[str, UciOption] = {}
         self._active_engines = active_engines
         self._queue: queue.Queue[str | None] = queue.Queue()
         self._closed = False
@@ -216,6 +227,10 @@ class UciEngine:
             line = self.read_line(remaining)
             if line.startswith("id name "):
                 self.name = line.removeprefix("id name ").strip() or self.name
+            elif line.startswith("option name "):
+                option = parse_uci_option(line)
+                if option is not None:
+                    self.uci_options[option.name] = option
             if line == "uciok":
                 return
 
@@ -334,6 +349,30 @@ def option_text(value: int | bool | str) -> str:
     if isinstance(value, bool):
         return "true" if value else "false"
     return str(value)
+
+
+def parse_uci_option(line: str) -> UciOption | None:
+    match = re.match(
+        r"^option name (.*?) type (spin|check|combo|button|string)(?: (.*))?$",
+        line,
+    )
+    if match is None:
+        return None
+    name, option_type, attributes = match.groups()
+    attributes = attributes or ""
+    default_match = re.search(
+        r"(?:^| )default (.*?)(?= (?:min|max|var) |$)",
+        attributes,
+    )
+    min_match = re.search(r"(?:^| )min (-?\d+)(?: |$)", attributes)
+    max_match = re.search(r"(?:^| )max (-?\d+)(?: |$)", attributes)
+    return UciOption(
+        name=name,
+        type=option_type,
+        default=default_match.group(1) if default_match else None,
+        min=int(min_match.group(1)) if min_match else None,
+        max=int(max_match.group(1)) if max_match else None,
+    )
 
 
 def canonical_move(move: str) -> str:
@@ -911,6 +950,14 @@ def engine_names(
 def probe_engine_name(config: EngineConfig, label: str) -> str:
     with UciEngine(config, label=label) as engine:
         return engine.name
+
+
+def probe_engine_options(
+    config: EngineConfig,
+    label: str = "engine-options-probe",
+) -> tuple[str, dict[str, UciOption]]:
+    with UciEngine(config, label=label) as engine:
+        return engine.name, dict(engine.uci_options)
 
 
 def control_text(config: MatchConfig) -> str:
