@@ -12,6 +12,7 @@ import math
 import os
 import queue
 import random
+import re
 import subprocess
 import sys
 import threading
@@ -91,6 +92,24 @@ class SearchResult:
     result: str | None = None
 
 
+@dataclass(frozen=True)
+class UciOption:
+    name: str
+    type: str
+    default: str | None
+    min: int | None
+    max: int | None
+
+
+@dataclass
+class MatchResult:
+    records: list[dict[str, Any]]
+    summary: dict[str, Any]
+    engine1_name: str
+    engine2_name: str
+    interrupted: bool
+
+
 class ActiveEngines:
     def __init__(self) -> None:
         self._lock = threading.Lock()
@@ -130,6 +149,7 @@ class UciEngine:
         self.config = config
         self.label = label
         self.name = config.path.name
+        self.uci_options: dict[str, UciOption] = {}
         self._active_engines = active_engines
         self._queue: queue.Queue[str | None] = queue.Queue()
         self._closed = False
@@ -207,6 +227,10 @@ class UciEngine:
             line = self.read_line(remaining)
             if line.startswith("id name "):
                 self.name = line.removeprefix("id name ").strip() or self.name
+            elif line.startswith("option name "):
+                option = parse_uci_option(line)
+                if option is not None:
+                    self.uci_options[option.name] = option
             if line == "uciok":
                 return
 
@@ -325,6 +349,30 @@ def option_text(value: int | bool | str) -> str:
     if isinstance(value, bool):
         return "true" if value else "false"
     return str(value)
+
+
+def parse_uci_option(line: str) -> UciOption | None:
+    match = re.match(
+        r"^option name (.*?) type (spin|check|combo|button|string)(?: (.*))?$",
+        line,
+    )
+    if match is None:
+        return None
+    name, option_type, attributes = match.groups()
+    attributes = attributes or ""
+    default_match = re.search(
+        r"(?:^| )default (.*?)(?= (?:min|max|var) |$)",
+        attributes,
+    )
+    min_match = re.search(r"(?:^| )min (-?\d+)(?: |$)", attributes)
+    max_match = re.search(r"(?:^| )max (-?\d+)(?: |$)", attributes)
+    return UciOption(
+        name=name,
+        type=option_type,
+        default=default_match.group(1) if default_match else None,
+        min=int(min_match.group(1)) if min_match else None,
+        max=int(max_match.group(1)) if max_match else None,
+    )
 
 
 def canonical_move(move: str) -> str:
@@ -904,6 +952,14 @@ def probe_engine_name(config: EngineConfig, label: str) -> str:
         return engine.name
 
 
+def probe_engine_options(
+    config: EngineConfig,
+    label: str = "engine-options-probe",
+) -> tuple[str, dict[str, UciOption]]:
+    with UciEngine(config, label=label) as engine:
+        return engine.name, dict(engine.uci_options)
+
+
 def control_text(config: MatchConfig) -> str:
     if config.limit_kind == "clock":
         return f"tc {config.base_time_ms}ms + {config.increment_ms}ms"
@@ -1018,6 +1074,114 @@ def validate_engine(config: EngineConfig, label: str) -> None:
         raise ValueError(f"{label} is not executable: {config.path}")
 
 
+def build_tasks(
+    starts: list[StartPosition],
+    records_by_id: dict[str, dict[str, Any]] | None = None,
+) -> list[GameTask]:
+    completed = records_by_id or {}
+    tasks: list[GameTask] = []
+    for pair, start in enumerate(starts, 1):
+        team_order = ("ry", "bg") if pair % 2 else ("bg", "ry")
+        for team in team_order:
+            task = GameTask(pair, team, start)
+            if task.game_id not in completed:
+                tasks.append(task)
+    return tasks
+
+
+def execute_tasks(
+    config: MatchConfig,
+    tasks: list[GameTask],
+    records_by_id: dict[str, dict[str, Any]],
+    *,
+    continue_on_error: bool,
+    on_record: Any = None,
+) -> bool:
+    stop_event = threading.Event()
+    active_engines = ActiveEngines()
+
+    def run_task(task: GameTask) -> dict[str, Any]:
+        return play_game(config, task, stop_event, active_engines)
+
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=config.workers)
+    futures: dict[concurrent.futures.Future[dict[str, Any]], GameTask] = {}
+    try:
+        futures = {executor.submit(run_task, task): task for task in tasks}
+        for future in concurrent.futures.as_completed(futures):
+            task = futures[future]
+            try:
+                record = future.result()
+            except Exception as exc:
+                if not continue_on_error:
+                    raise
+                record = {
+                    "game_id": task.game_id,
+                    "pair": task.pair_index,
+                    "engine1_team": task.engine1_team,
+                    "fen": task.start.fen,
+                    "opening": task.start.opening_moves,
+                    "moves": task.start.opening_moves,
+                    "result": "draw",
+                    "engine1_score": 0.5,
+                    "termination": "runner_error",
+                    "error": f"{type(exc).__name__}: {exc}",
+                }
+            records_by_id[task.game_id] = record
+            if on_record is not None:
+                on_record(record, records_by_id)
+    except KeyboardInterrupt:
+        stop_event.set()
+        for future in futures:
+            future.cancel()
+        active_engines.close_all()
+        executor.shutdown(wait=True, cancel_futures=True)
+        return True
+    except BaseException:
+        stop_event.set()
+        for future in futures:
+            future.cancel()
+        active_engines.close_all()
+        executor.shutdown(wait=True, cancel_futures=True)
+        raise
+    else:
+        executor.shutdown(wait=True)
+        return False
+
+
+def play_match(
+    config: MatchConfig,
+    *,
+    pairs: int,
+    seed: int,
+    continue_on_error: bool = False,
+    on_record: Any = None,
+) -> MatchResult:
+    """Run an in-memory paired match for callers such as tuning tools."""
+    for engine, label in (
+        (config.engine1, "Engine 1"),
+        (config.engine2, "Engine 2"),
+    ):
+        validate_engine(engine, label)
+    if config.arbiter is not None:
+        validate_engine(config.arbiter, "Arbiter")
+
+    starts = create_schedule(config, pairs, seed, None, False)
+    records_by_id: dict[str, dict[str, Any]] = {}
+    interrupted = execute_tasks(
+        config,
+        build_tasks(starts),
+        records_by_id,
+        continue_on_error=continue_on_error,
+        on_record=on_record,
+    )
+    records = list(records_by_id.values())
+    name1, name2 = engine_names(records, config.engine1, config.engine2)
+    summary = summarize(records, pairs * 2)
+    summary["engine1_name"] = name1
+    summary["engine2_name"] = name2
+    return MatchResult(records, summary, name1, name2, interrupted)
+
+
 def run_match(args: argparse.Namespace) -> int:
     engine1 = EngineConfig(
         Path(args.engine1).resolve(),
@@ -1123,59 +1287,34 @@ def run_match(args: argparse.Namespace) -> int:
         name1 = probe_engine_name(engine1, "engine1-probe")
         name2 = probe_engine_name(engine2, "engine2-probe")
     print_start_banner(config, args.pairs * 2, name1, name2)
-    tasks: list[GameTask] = []
-    for pair in range(1, args.pairs + 1):
-        team_order = ("ry", "bg") if pair % 2 else ("bg", "ry")
-        for team in team_order:
-            if f"pair{pair:04d}-{team}" not in records_by_id:
-                tasks.append(GameTask(pair, team, starts[pair - 1]))
-    stop_event = threading.Event()
-    active_engines = ActiveEngines()
+    tasks = build_tasks(starts, records_by_id)
 
-    def run_task(task: GameTask) -> dict[str, Any]:
-        return play_game(config, task, stop_event, active_engines)
+    def on_record(
+        record: dict[str, Any],
+        current_by_id: dict[str, dict[str, Any]],
+    ) -> None:
+        if out is not None:
+            append_jsonl(out, record)
+        current_records = list(current_by_id.values())
+        summary = summarize(current_records, args.pairs * 2)
+        current_name1, current_name2 = engine_names(
+            current_records, engine1, engine2
+        )
+        summary["engine1_name"] = current_name1
+        summary["engine2_name"] = current_name2
+        if summary_path is not None:
+            atomic_json(summary_path, summary)
+        if not args.quiet:
+            print_summary(summary, current_name1, current_name2, record)
 
-    executor = concurrent.futures.ThreadPoolExecutor(max_workers=args.workers)
-    futures: dict[concurrent.futures.Future[dict[str, Any]], GameTask] = {}
-    try:
-        futures = {executor.submit(run_task, task): task for task in tasks}
-        for future in concurrent.futures.as_completed(futures):
-            task = futures[future]
-            try:
-                record = future.result()
-            except Exception as exc:
-                if not args.continue_on_error:
-                    raise
-                record = {
-                    "game_id": task.game_id,
-                    "pair": task.pair_index,
-                    "engine1_team": task.engine1_team,
-                    "fen": task.start.fen,
-                    "opening": task.start.opening_moves,
-                    "moves": task.start.opening_moves,
-                    "result": "draw",
-                    "engine1_score": 0.5,
-                    "termination": "runner_error",
-                    "error": f"{type(exc).__name__}: {exc}",
-                }
-            records_by_id[task.game_id] = record
-            if out is not None:
-                append_jsonl(out, record)
-            current_records = list(records_by_id.values())
-            summary = summarize(current_records, args.pairs * 2)
-            name1, name2 = engine_names(current_records, engine1, engine2)
-            summary["engine1_name"] = name1
-            summary["engine2_name"] = name2
-            if summary_path is not None:
-                atomic_json(summary_path, summary)
-            if not args.quiet:
-                print_summary(summary, name1, name2, record)
-    except KeyboardInterrupt:
-        stop_event.set()
-        for future in futures:
-            future.cancel()
-        active_engines.close_all()
-        executor.shutdown(wait=True, cancel_futures=True)
+    interrupted = execute_tasks(
+        config,
+        tasks,
+        records_by_id,
+        continue_on_error=args.continue_on_error,
+        on_record=on_record,
+    )
+    if interrupted:
         interrupted_records = list(records_by_id.values())
         summary = summarize(interrupted_records, args.pairs * 2)
         if interrupted_records:
@@ -1193,8 +1332,6 @@ def run_match(args: argparse.Namespace) -> int:
         if message:
             print(message, file=sys.stderr)
         return 130
-    else:
-        executor.shutdown(wait=True)
 
     final_records = list(records_by_id.values())
     summary = summarize(final_records, args.pairs * 2)
