@@ -90,6 +90,7 @@ class SearchResult:
     info: dict[str, Any]
     elapsed_ms: int
     result: str | None = None
+    position_error: str | None = None
 
 
 @dataclass(frozen=True)
@@ -241,6 +242,8 @@ class UciEngine:
             if remaining <= 0:
                 raise TimeoutError(f"{self.label} timed out waiting for {prefix}")
             line = self.read_line(remaining)
+            if line.startswith("info string invalid command:"):
+                raise EngineError(f"{self.label} rejected command: {line}")
             if line.startswith(prefix):
                 return line
 
@@ -307,6 +310,32 @@ class UciEngine:
                     elapsed,
                     completed_result(line),
                 )
+            if line.startswith("info string"):
+                lowered = line.lower()
+                if "illegal move" in lowered or "invalid move" in lowered:
+                    elapsed = int(round((time.monotonic() - started) * 1000))
+                    return SearchResult(
+                        None,
+                        info,
+                        elapsed,
+                        position_error=line.removeprefix("info string").strip(),
+                    )
+                if any(
+                    phrase in lowered
+                    for phrase in (
+                        "invalid fen",
+                        "invalid position",
+                        "illegal fen",
+                        "illegal position",
+                    )
+                ):
+                    elapsed = int(round((time.monotonic() - started) * 1000))
+                    return SearchResult(
+                        None,
+                        info,
+                        elapsed,
+                        position_error=line.removeprefix("info string").strip(),
+                    )
             if line.startswith("info "):
                 info.update(parse_info(line))
             elif line.startswith("bestmove"):
@@ -618,7 +647,6 @@ def play_game(
             color = TURN_ORDER[(start_turn + len(moves)) % 4]
             team = TEAM_BY_COLOR[color]
             engine = ry_engine if team == "ry" else bg_engine
-            rules_engine = arbiter or engine
             if arbiter is not None:
                 result = arbiter.game_result(moves, task.start.fen)
                 if result != "ongoing":
@@ -631,40 +659,12 @@ def play_game(
                     })
                     return record
 
-            legal = rules_engine.legal_moves(moves, task.start.fen)
-            if not legal:
-                if arbiter is None:
-                    try:
-                        completed = engine.search(
-                            moves,
-                            task.start.fen,
-                            "go depth 1",
-                            min(config.timeout, 30.0),
-                        )
-                    except TimeoutError:
-                        completed = SearchResult(None, {}, 0)
-                    if completed.result in {"ry_win", "bg_win", "draw"}:
-                        result = completed.result
-                        record.update({
-                            "moves": list(moves),
-                            "result": result,
-                            "engine1_score": engine1_score(result, task.engine1_team),
-                            "termination": "completed_no_legal_moves",
-                            "final_clocks_ms": clocks,
-                        })
-                        return record
-                    result = current_engine_result(
-                        engine, moves, task.start.fen, config.timeout
-                    )
-                    if result in {"ry_win", "bg_win", "draw"}:
-                        record.update({
-                            "moves": list(moves),
-                            "result": result,
-                            "engine1_score": engine1_score(result, task.engine1_team),
-                            "termination": "current_engine_game_result",
-                            "final_clocks_ms": clocks,
-                        })
-                        return record
+            legal = (
+                arbiter.legal_moves(moves, task.start.fen)
+                if arbiter is not None
+                else None
+            )
+            if legal == []:
                 record.update({
                     "moves": list(moves),
                     "result": "draw",
@@ -676,7 +676,7 @@ def play_game(
 
             engine_number = ry_number if team == "ry" else bg_number
 
-            if len(legal) == 1:
+            if legal is not None and len(legal) == 1:
                 search = SearchResult(legal[0], {}, 0)
             else:
                 try:
@@ -697,6 +697,27 @@ def play_game(
                     })
                     return record
 
+            if search.position_error is not None:
+                if not moves:
+                    raise EngineError(
+                        f"{engine.label} rejected the starting position: "
+                        f"{search.position_error}"
+                    )
+                previous_team = "bg" if team == "ry" else "ry"
+                previous_number = bg_number if previous_team == "bg" else ry_number
+                result = winner_for_failure(previous_team)
+                record.update({
+                    "moves": list(moves),
+                    "result": result,
+                    "engine1_score": engine1_score(result, task.engine1_team),
+                    "termination": f"engine{previous_number}_illegal_move",
+                    "illegal_move": moves[-1],
+                    "reported_by": engine.name,
+                    "position_error": search.position_error,
+                    "final_clocks_ms": clocks,
+                })
+                return record
+
             if search.result in {"ry_win", "bg_win", "draw"}:
                 result = search.result
                 record.update({
@@ -708,19 +729,15 @@ def play_game(
                 })
                 return record
 
-            if search.bestmove is None and arbiter is None:
-                result = current_engine_result(
-                    engine, moves, task.start.fen, config.timeout
-                )
-                if result in {"ry_win", "bg_win", "draw"}:
-                    record.update({
-                        "moves": list(moves),
-                        "result": result,
-                        "engine1_score": engine1_score(result, task.engine1_team),
-                        "termination": "current_engine_game_result",
-                        "final_clocks_ms": clocks,
-                    })
-                    return record
+            if search.bestmove is None:
+                record.update({
+                    "moves": list(moves),
+                    "result": "draw",
+                    "engine1_score": 0.5,
+                    "termination": "no_legal_moves",
+                    "final_clocks_ms": clocks,
+                })
+                return record
 
             if config.limit_kind == "clock":
                 clocks[team] -= search.elapsed_ms
@@ -736,7 +753,7 @@ def play_game(
                     return record
                 clocks[team] += config.increment_ms
 
-            if search.bestmove not in legal:
+            if legal is not None and search.bestmove not in legal:
                 result = winner_for_failure(team)
                 record.update({
                     "moves": list(moves),
@@ -958,6 +975,23 @@ def probe_engine_options(
 ) -> tuple[str, dict[str, UciOption]]:
     with UciEngine(config, label=label) as engine:
         return engine.name, dict(engine.uci_options)
+
+
+def validate_rules_commands(
+    config: EngineConfig,
+    label: str,
+    *,
+    require_game_result: bool,
+) -> None:
+    with UciEngine(config, label=label) as engine:
+        engine.new_game()
+        engine.legal_moves([], None)
+        if require_game_result:
+            result = engine.game_result([], None)
+            if result not in {"ongoing", "ry_win", "bg_win", "draw"}:
+                raise EngineError(
+                    f"{label} returned an invalid gameresult response: {result}"
+                )
 
 
 def control_text(config: MatchConfig) -> str:
@@ -1374,6 +1408,9 @@ def run_match(args: argparse.Namespace) -> int:
         args.moves,
         out,
     )
+    if arbiter is not None:
+        validate_rules_commands(arbiter, "Arbiter", require_game_result=True)
+
     metadata_path = sidecar(out, ".meta.json") if out is not None else None
     schedule_path = sidecar(out, ".schedule.json") if out is not None else None
     summary_path = sidecar(out, ".summary.json") if out is not None else None
