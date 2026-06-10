@@ -243,6 +243,61 @@ def parameter_scale(spec: dict[str, Any]) -> float:
     return max(float(spec["step"]), float(spec["perturb"]), 1.0)
 
 
+def phase_schedule(
+    iterations: int,
+    pairs_per_iter: int,
+    phased: bool,
+    refine_pairs_multiplier: int = 2,
+    refine_start: int | None = None,
+) -> list[dict[str, Any]]:
+    if not phased or iterations == 1:
+        name = "exploration" if phased else "standard"
+        return [
+            {
+                "name": name,
+                "start": 1,
+                "end": iterations,
+                "iterations": iterations,
+                "pairs_per_iter": pairs_per_iter,
+            }
+        ]
+
+    exploration_pairs = pairs_per_iter
+    refine_pairs = pairs_per_iter * refine_pairs_multiplier
+    if refine_start is None:
+        exploration_iterations = max(1, round(iterations * 2 / 3))
+        exploration_iterations = min(exploration_iterations, iterations - 1)
+    else:
+        exploration_iterations = refine_start - 1
+    refine_iterations = iterations - exploration_iterations
+    return [
+        {
+            "name": "exploration",
+            "start": 1,
+            "end": exploration_iterations,
+            "iterations": exploration_iterations,
+            "pairs_per_iter": exploration_pairs,
+        },
+        {
+            "name": "refine",
+            "start": exploration_iterations + 1,
+            "end": iterations,
+            "iterations": refine_iterations,
+            "pairs_per_iter": refine_pairs,
+        },
+    ]
+
+
+def iteration_phase(
+    schedule: list[dict[str, Any]],
+    iteration: int,
+) -> dict[str, Any]:
+    for phase in schedule:
+        if int(phase["start"]) <= iteration <= int(phase["end"]):
+            return phase
+    raise ValueError(f"No SPSA phase contains iteration {iteration}")
+
+
 def timestamped_run_dir() -> Path:
     stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
     return ROOT / "tuning" / f"spsa-{stamp}"
@@ -320,6 +375,7 @@ def save_iteration_games(
 def run_iteration(
     args: argparse.Namespace,
     iteration: int,
+    pairs_per_iter: int,
     minus: dict[str, int],
     plus: dict[str, int],
 ) -> tuple[float, dict[str, Any], list[dict[str, Any]]]:
@@ -332,7 +388,7 @@ def run_iteration(
         if not args.game_verbose:
             return
         summary = match_runner.summarize(
-            list(records_by_id.values()), args.pairs_per_iter * 2
+            list(records_by_id.values()), pairs_per_iter * 2
         )
         print(
             f"  game {summary['games_completed']}/{summary['games_expected']}: "
@@ -344,7 +400,7 @@ def run_iteration(
 
     result = match_runner.play_match(
         config,
-        pairs=args.pairs_per_iter,
+        pairs=pairs_per_iter,
         seed=args.seed * 10_000 + iteration,
         on_record=show_game,
     )
@@ -359,7 +415,7 @@ def run_fingerprint(
     train_names: list[str],
     fixed: dict[str, int],
 ) -> dict[str, Any]:
-    payload = {
+    payload: dict[str, Any] = {
         "format": 1,
         "optimizer": "normalized_spsa",
         "engine": str(Path(args.engine).resolve()),
@@ -393,6 +449,15 @@ def run_fingerprint(
         "gamma": args.gamma,
         "seed": args.seed,
     }
+    if args.phased:
+        payload["phased"] = True
+        payload["phase_schedule"] = phase_schedule(
+            args.iterations,
+            args.pairs_per_iter,
+            True,
+            args.refine_pairs_multiplier,
+            args.refine_start,
+        )
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
     return {
         "fingerprint": hashlib.sha256(encoded).hexdigest(),
@@ -448,6 +513,8 @@ def changed_text(
 def print_iteration(
     args: argparse.Namespace,
     iteration: int,
+    phase_name: str,
+    pairs_per_iter: int,
     score: float,
     direction: float,
     summary: dict[str, Any],
@@ -463,7 +530,8 @@ def print_iteration(
     )
     if not args.verbose:
         print(
-            f"[{iteration}/{args.iterations}] plus {result} | "
+            f"[{iteration}/{args.iterations}] {phase_name} "
+            f"({pairs_per_iter} pairs) | plus {result} | "
             f"{100 * score:.2f}% | direction {direction:+.3f}",
             flush=True,
         )
@@ -473,8 +541,9 @@ def print_iteration(
         average = sum(elapsed_history) / len(elapsed_history)
         eta = format_duration(average * (args.iterations - iteration))
     print(
-        f"SPSA iteration {iteration}/{args.iterations} | "
-        f"{summary['games_completed']} games | {control_text(args)}"
+        f"SPSA iteration {iteration}/{args.iterations} | {phase_name} | "
+        f"{pairs_per_iter} pairs | {summary['games_completed']} games | "
+        f"{control_text(args)}"
     )
     print(f"  Plus: {result} | score {score:.3f} | direction {direction:+.3f}")
     print(f"  Update: {changed_text(before, after, train_names)}")
@@ -515,6 +584,13 @@ def command_spsa(args: argparse.Namespace) -> None:
     if not selected:
         raise ValueError("All selected parameters are fixed")
     train_names = [str(spec["name"]) for spec in selected]
+    schedule = phase_schedule(
+        args.iterations,
+        args.pairs_per_iter,
+        args.phased,
+        args.refine_pairs_multiplier,
+        args.refine_start,
+    )
 
     out_dir = Path(args.out_dir).resolve() if args.out_dir else timestamped_run_dir()
     if args.fresh and out_dir.exists():
@@ -572,10 +648,17 @@ def command_spsa(args: argparse.Namespace) -> None:
     if args.verbose:
         print(f"Engine: {Path(args.engine).resolve()}")
         print(f"Training {len(train_names)} parameter(s): {', '.join(train_names)}")
+        for phase in schedule:
+            print(
+                f"Phase {phase['name']}: iterations {phase['start']}-"
+                f"{phase['end']}, {phase['pairs_per_iter']} pairs/iteration"
+            )
         print(f"Output: {out_dir}", flush=True)
 
     for iteration in range(completed + 1, args.iterations + 1):
         started = time.monotonic()
+        phase = iteration_phase(schedule, iteration)
+        pairs_per_iter = int(phase["pairs_per_iter"])
         rng = random.Random(args.seed * 1_000_003 + iteration)
         ck = 1.0 / (iteration**args.gamma)
         ak = args.learning_rate / ((iteration + args.stability) ** args.alpha)
@@ -598,7 +681,7 @@ def command_spsa(args: argparse.Namespace) -> None:
             scales[name] = parameter_scale(spec)
 
         score, summary, records = run_iteration(
-            args, iteration, minus, plus
+            args, iteration, pairs_per_iter, minus, plus
         )
         direction = 2.0 * (score - 0.5)
         before = dict(theta)
@@ -623,6 +706,8 @@ def command_spsa(args: argparse.Namespace) -> None:
         elapsed_history.append(elapsed)
         payload = {
             "iteration": iteration,
+            "phase": phase["name"],
+            "pairs_per_iter": pairs_per_iter,
             "score_plus": score,
             "direction": direction,
             "learning_rate": ak,
@@ -654,6 +739,8 @@ def command_spsa(args: argparse.Namespace) -> None:
         print_iteration(
             args,
             iteration,
+            str(phase["name"]),
+            pairs_per_iter,
             score,
             direction,
             summary,
@@ -723,6 +810,27 @@ def build_parser() -> argparse.ArgumentParser:
     spsa.add_argument("--initial", default="")
     spsa.add_argument("--iterations", type=int, default=20)
     spsa.add_argument("--pairs-per-iter", type=int, default=4)
+    spsa.add_argument(
+        "--phased",
+        action="store_true",
+        help=(
+            "use base-pair exploration iterations followed by higher-pair "
+            "refinement iterations"
+        ),
+    )
+    spsa.add_argument(
+        "--refine-pairs-multiplier",
+        type=int,
+        default=2,
+        metavar="N",
+        help="multiply --pairs-per-iter by N during refinement (default: 2)",
+    )
+    spsa.add_argument(
+        "--refine-start",
+        type=int,
+        metavar="ITERATION",
+        help="first refinement iteration (default: start of final third)",
+    )
     spsa.add_argument("--learning-rate", type=float, default=1.5)
     spsa.add_argument("--stability", type=float, default=4.0)
     spsa.add_argument("--alpha", type=float, default=0.602)
@@ -762,6 +870,18 @@ def validate_args(args: argparse.Namespace, parser: argparse.ArgumentParser) -> 
         args.tc = 0
     if args.iterations < 1 or args.pairs_per_iter < 1:
         parser.error("--iterations and --pairs-per-iter must be at least 1")
+    if args.refine_pairs_multiplier < 1:
+        parser.error("--refine-pairs-multiplier must be at least 1")
+    if not args.phased and (
+        args.refine_pairs_multiplier != 2 or args.refine_start is not None
+    ):
+        parser.error(
+            "--refine-pairs-multiplier and --refine-start require --phased"
+        )
+    if args.refine_start is not None and not (
+        2 <= args.refine_start <= args.iterations
+    ):
+        parser.error("--refine-start must be between 2 and --iterations")
     if args.workers < 1 or args.threads < 1:
         parser.error("--workers and --threads must be at least 1")
     if args.limit_kind == "clock" and args.tc <= 0:
