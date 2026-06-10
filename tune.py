@@ -521,6 +521,58 @@ def control_text(control: dict[str, int | str]) -> str:
     return f"{control['limit_kind']} {control['limit_value']}"
 
 
+def control_work(control: dict[str, int | str]) -> float | None:
+    kind = control["limit_kind"]
+    if kind in {"nodes", "movetime"}:
+        return float(control["limit_value"])
+    if kind == "clock":
+        return float(control["tc"]) + 40.0 * float(control["inc"])
+    return None
+
+
+def control_ratio(
+    source: dict[str, int | str],
+    target: dict[str, int | str],
+) -> float:
+    if source["limit_kind"] != target["limit_kind"]:
+        return 1.0
+    source_work = control_work(source)
+    target_work = control_work(target)
+    if source_work is None or target_work is None or source_work <= 0:
+        return 1.0
+    return target_work / source_work
+
+
+def estimate_eta_seconds(
+    args: argparse.Namespace,
+    schedule: list[dict[str, Any]],
+    iteration: int,
+    timing_history: list[dict[str, Any]],
+) -> float | None:
+    if not timing_history or iteration >= args.iterations:
+        return None
+
+    remaining = 0.0
+    for future_iteration in range(iteration + 1, args.iterations + 1):
+        phase = iteration_phase(schedule, future_iteration)
+        target_control = phase_control(args, str(phase["name"]))
+        exact = [
+            sample
+            for sample in timing_history
+            if sample["phase"] == phase["name"]
+            and sample["control"] == target_control
+        ]
+        samples = exact or timing_history
+        per_pair = sum(
+            float(sample["elapsed_seconds"])
+            / int(sample["pairs_per_iter"])
+            * control_ratio(sample["control"], target_control)
+            for sample in samples
+        ) / len(samples)
+        remaining += per_pair * int(phase["pairs_per_iter"])
+    return remaining
+
+
 def changed_text(
     before: dict[str, int],
     after: dict[str, int],
@@ -551,7 +603,8 @@ def print_iteration(
     after: dict[str, int],
     train_names: list[str],
     elapsed: float,
-    elapsed_history: list[float],
+    schedule: list[dict[str, Any]],
+    timing_history: list[dict[str, Any]],
 ) -> None:
     result = (
         f"+{summary['engine2_wins']} ={summary['draws']} "
@@ -566,9 +619,14 @@ def print_iteration(
         )
         return
     eta = "--"
-    if control["limit_kind"] in {"movetime", "clock"} and elapsed_history:
-        average = sum(elapsed_history) / len(elapsed_history)
-        eta = format_duration(average * (args.iterations - iteration))
+    eta_seconds = estimate_eta_seconds(
+        args,
+        schedule,
+        iteration,
+        timing_history,
+    )
+    if eta_seconds is not None:
+        eta = format_duration(eta_seconds)
     print(
         f"SPSA iteration {iteration}/{args.iterations} | {phase_name} | "
         f"{pairs_per_iter} pairs | {summary['games_completed']} games | "
@@ -643,8 +701,14 @@ def command_spsa(args: argparse.Namespace) -> None:
     history_path = out_dir / "history.jsonl"
     history = load_jsonl(history_path) if args.resume else []
     completed = max((int(item["iteration"]) for item in history), default=0)
-    elapsed_history = [
-        float(item["elapsed_seconds"])
+    base_control = phase_control(args, "exploration")
+    timing_history = [
+        {
+            "phase": str(item.get("phase", "standard")),
+            "pairs_per_iter": int(item.get("pairs_per_iter", args.pairs_per_iter)),
+            "control": item.get("control", base_control),
+            "elapsed_seconds": float(item["elapsed_seconds"]),
+        }
         for item in history
         if isinstance(item.get("elapsed_seconds"), (int, float))
     ]
@@ -733,7 +797,14 @@ def command_spsa(args: argparse.Namespace) -> None:
             theta[name] = clamp_round(theta_float[name], spec)
 
         elapsed = time.monotonic() - started
-        elapsed_history.append(elapsed)
+        timing_history.append(
+            {
+                "phase": phase["name"],
+                "pairs_per_iter": pairs_per_iter,
+                "control": control,
+                "elapsed_seconds": elapsed,
+            }
+        )
         payload = {
             "iteration": iteration,
             "phase": phase["name"],
@@ -780,7 +851,8 @@ def command_spsa(args: argparse.Namespace) -> None:
             theta,
             train_names,
             elapsed,
-            elapsed_history,
+            schedule,
+            timing_history,
         )
 
     final = {
