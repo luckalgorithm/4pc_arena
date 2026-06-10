@@ -322,6 +322,7 @@ def make_match_config(
     args: argparse.Namespace,
     minus: dict[str, int],
     plus: dict[str, int],
+    control: dict[str, int | str],
 ) -> match_runner.MatchConfig:
     base_options = match_runner.load_options(args.engine_options, args.engine_option)
     minus_options = dict(base_options)
@@ -344,10 +345,10 @@ def make_match_config(
             args.engine, plus_options, hash_mb=args.hash, threads=args.threads
         ),
         arbiter=arbiter,
-        limit_kind=args.limit_kind,
-        limit_value=args.limit_value,
-        base_time_ms=args.tc,
-        increment_ms=args.inc,
+        limit_kind=str(control["limit_kind"]),
+        limit_value=int(control["limit_value"]),
+        base_time_ms=int(control["tc"]),
+        increment_ms=int(control["inc"]),
         timeout=args.timeout,
         margin_ms=args.margin,
         max_plies=args.max_plies,
@@ -376,10 +377,11 @@ def run_iteration(
     args: argparse.Namespace,
     iteration: int,
     pairs_per_iter: int,
+    control: dict[str, int | str],
     minus: dict[str, int],
     plus: dict[str, int],
 ) -> tuple[float, dict[str, Any], list[dict[str, Any]]]:
-    config = make_match_config(args, minus, plus)
+    config = make_match_config(args, minus, plus, control)
 
     def show_game(
         record: dict[str, Any],
@@ -458,6 +460,13 @@ def run_fingerprint(
             args.refine_pairs_multiplier,
             args.refine_start,
         )
+        if args.refine_limit_kind is not None:
+            payload["refine_control"] = {
+                "limit_kind": args.refine_limit_kind,
+                "limit_value": args.refine_limit_value,
+                "tc": args.refine_tc or 0,
+                "inc": args.refine_inc,
+            }
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
     return {
         "fingerprint": hashlib.sha256(encoded).hexdigest(),
@@ -487,10 +496,29 @@ def format_duration(seconds: float) -> str:
     return f"{secs}s"
 
 
-def control_text(args: argparse.Namespace) -> str:
-    if args.limit_kind == "clock":
-        return f"tc {args.tc}ms + {args.inc}ms"
-    return f"{args.limit_kind} {args.limit_value}"
+def phase_control(
+    args: argparse.Namespace,
+    phase_name: str,
+) -> dict[str, int | str]:
+    if phase_name == "refine" and args.refine_limit_kind is not None:
+        return {
+            "limit_kind": args.refine_limit_kind,
+            "limit_value": args.refine_limit_value,
+            "tc": args.refine_tc or 0,
+            "inc": args.refine_inc,
+        }
+    return {
+        "limit_kind": args.limit_kind,
+        "limit_value": args.limit_value,
+        "tc": args.tc,
+        "inc": args.inc,
+    }
+
+
+def control_text(control: dict[str, int | str]) -> str:
+    if control["limit_kind"] == "clock":
+        return f"tc {control['tc']}ms + {control['inc']}ms"
+    return f"{control['limit_kind']} {control['limit_value']}"
 
 
 def changed_text(
@@ -515,6 +543,7 @@ def print_iteration(
     iteration: int,
     phase_name: str,
     pairs_per_iter: int,
+    control: dict[str, int | str],
     score: float,
     direction: float,
     summary: dict[str, Any],
@@ -537,13 +566,13 @@ def print_iteration(
         )
         return
     eta = "--"
-    if args.limit_kind in {"movetime", "clock"} and elapsed_history:
+    if control["limit_kind"] in {"movetime", "clock"} and elapsed_history:
         average = sum(elapsed_history) / len(elapsed_history)
         eta = format_duration(average * (args.iterations - iteration))
     print(
         f"SPSA iteration {iteration}/{args.iterations} | {phase_name} | "
         f"{pairs_per_iter} pairs | {summary['games_completed']} games | "
-        f"{control_text(args)}"
+        f"{control_text(control)}"
     )
     print(f"  Plus: {result} | score {score:.3f} | direction {direction:+.3f}")
     print(f"  Update: {changed_text(before, after, train_names)}")
@@ -659,6 +688,7 @@ def command_spsa(args: argparse.Namespace) -> None:
         started = time.monotonic()
         phase = iteration_phase(schedule, iteration)
         pairs_per_iter = int(phase["pairs_per_iter"])
+        control = phase_control(args, str(phase["name"]))
         rng = random.Random(args.seed * 1_000_003 + iteration)
         ck = 1.0 / (iteration**args.gamma)
         ak = args.learning_rate / ((iteration + args.stability) ** args.alpha)
@@ -681,7 +711,7 @@ def command_spsa(args: argparse.Namespace) -> None:
             scales[name] = parameter_scale(spec)
 
         score, summary, records = run_iteration(
-            args, iteration, pairs_per_iter, minus, plus
+            args, iteration, pairs_per_iter, control, minus, plus
         )
         direction = 2.0 * (score - 0.5)
         before = dict(theta)
@@ -708,6 +738,7 @@ def command_spsa(args: argparse.Namespace) -> None:
             "iteration": iteration,
             "phase": phase["name"],
             "pairs_per_iter": pairs_per_iter,
+            "control": control,
             "score_plus": score,
             "direction": direction,
             "learning_rate": ak,
@@ -741,6 +772,7 @@ def command_spsa(args: argparse.Namespace) -> None:
             iteration,
             str(phase["name"]),
             pairs_per_iter,
+            control,
             score,
             direction,
             summary,
@@ -831,6 +863,21 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="ITERATION",
         help="first refinement iteration (default: start of final third)",
     )
+    refine_limit = spsa.add_mutually_exclusive_group()
+    refine_limit.add_argument("--refine-nodes", type=int)
+    refine_limit.add_argument("--refine-depth", type=int)
+    refine_limit.add_argument("--refine-movetime", type=int)
+    refine_limit.add_argument(
+        "--refine-tc",
+        type=int,
+        help="refinement base time in milliseconds",
+    )
+    spsa.add_argument(
+        "--refine-inc",
+        type=int,
+        default=0,
+        help="refinement clock increment in milliseconds",
+    )
     spsa.add_argument("--learning-rate", type=float, default=1.5)
     spsa.add_argument("--stability", type=float, default=4.0)
     spsa.add_argument("--alpha", type=float, default=0.602)
@@ -868,15 +915,33 @@ def validate_args(args: argparse.Namespace, parser: argparse.ArgumentParser) -> 
         args.limit_kind = "nodes"
         args.limit_value = args.nodes if args.nodes is not None else 10000
         args.tc = 0
+    if args.refine_tc is not None:
+        args.refine_limit_kind = "clock"
+        args.refine_limit_value = 0
+    elif args.refine_movetime is not None:
+        args.refine_limit_kind = "movetime"
+        args.refine_limit_value = args.refine_movetime
+    elif args.refine_depth is not None:
+        args.refine_limit_kind = "depth"
+        args.refine_limit_value = args.refine_depth
+    elif args.refine_nodes is not None:
+        args.refine_limit_kind = "nodes"
+        args.refine_limit_value = args.refine_nodes
+    else:
+        args.refine_limit_kind = None
+        args.refine_limit_value = 0
     if args.iterations < 1 or args.pairs_per_iter < 1:
         parser.error("--iterations and --pairs-per-iter must be at least 1")
     if args.refine_pairs_multiplier < 1:
         parser.error("--refine-pairs-multiplier must be at least 1")
     if not args.phased and (
-        args.refine_pairs_multiplier != 2 or args.refine_start is not None
+        args.refine_pairs_multiplier != 2
+        or args.refine_start is not None
+        or args.refine_limit_kind is not None
+        or args.refine_inc
     ):
         parser.error(
-            "--refine-pairs-multiplier and --refine-start require --phased"
+            "refinement options require --phased"
         )
     if args.refine_start is not None and not (
         2 <= args.refine_start <= args.iterations
@@ -888,6 +953,18 @@ def validate_args(args: argparse.Namespace, parser: argparse.ArgumentParser) -> 
         parser.error("--tc must be greater than 0")
     if args.limit_kind != "clock" and args.inc:
         parser.error("--inc requires --tc")
+    if args.refine_limit_kind == "clock" and args.refine_tc <= 0:
+        parser.error("--refine-tc must be greater than 0")
+    if args.refine_limit_kind != "clock" and args.refine_inc:
+        parser.error("--refine-inc requires --refine-tc")
+    if args.refine_inc < 0:
+        parser.error("--refine-inc must be non-negative")
+    if (
+        args.refine_limit_kind is not None
+        and args.refine_limit_kind != "clock"
+        and args.refine_limit_value <= 0
+    ):
+        parser.error("refinement search limit must be greater than 0")
     if args.learning_rate <= 0 or args.stability < 0:
         parser.error("--learning-rate must be positive and --stability non-negative")
     if args.alpha <= 0 or args.gamma <= 0:
