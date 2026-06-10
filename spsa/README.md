@@ -94,7 +94,7 @@ The manifest is a JSON list, or an object containing a `parameters` list:
 {
   "parameters": [
     {
-      "name": "MobilityWeight",
+      "name": "EvalFeature",
       "default": 100,
       "min": 0,
       "max": 300,
