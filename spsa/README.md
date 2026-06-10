@@ -114,7 +114,7 @@ as a compatible UCI `spin` option.
 List available manifest groups with:
 
 ```bash
-PYTHONPATH=. python3 spsa/tune.py groups --params parameters.json
+python3 spsa/tune.py groups --params parameters.json
 ```
 
 ## Examples
@@ -122,7 +122,7 @@ PYTHONPATH=. python3 spsa/tune.py groups --params parameters.json
 Basic tune:
 
 ```bash
-PYTHONPATH=. python3 spsa/tune.py spsa \
+python3 spsa/tune.py spsa \
   --engine /path/to/engine \
   --params parameters.json \
   --iterations 100 \
@@ -136,7 +136,7 @@ PYTHONPATH=. python3 spsa/tune.py spsa \
 Phased tune with custom refinement:
 
 ```bash
-PYTHONPATH=. python3 spsa/tune.py spsa \
+python3 spsa/tune.py spsa \
   --engine /path/to/engine \
   --params parameters.json \
   --iterations 100 \

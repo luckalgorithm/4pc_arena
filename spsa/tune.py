@@ -14,10 +14,12 @@ import time
 from pathlib import Path
 from typing import Any
 
+SCRIPT_DIR = Path(__file__).resolve().parent
+ROOT = SCRIPT_DIR.parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
 import match as match_runner
-
-
-ROOT = Path(__file__).resolve().parent
 
 
 def read_json(path: Path) -> Any:
