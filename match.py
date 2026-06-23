@@ -16,6 +16,7 @@ import sys
 import threading
 import time
 from dataclasses import dataclass
+from collections.abc import Iterable, Iterator
 from pathlib import Path
 from typing import Any
 
@@ -51,10 +52,12 @@ class GameTask:
     pair_index: int
     engine1_team: str
     start: StartPosition
+    paired: bool = True
 
     @property
     def game_id(self) -> str:
-        return f"pair{self.pair_index:04d}-{self.engine1_team}"
+        prefix = "pair" if self.paired else "game"
+        return f"{prefix}{self.pair_index:04d}-{self.engine1_team}"
 
 @dataclass
 class MatchConfig:
@@ -97,6 +100,114 @@ class MatchResult:
     engine1_name: str
     engine2_name: str
     interrupted: bool
+
+class CompletionTracker:
+    def __init__(self, entries: int, *, paired: bool) -> None:
+        self.entries = entries
+        self.paired = paired
+        self._completed = bytearray(entries * (2 if paired else 1))
+
+    def _slot(self, index: int, team: str) -> int:
+        if index < 1 or index > self.entries:
+            raise ValueError(f"Game index is outside the schedule: {index}")
+        if not self.paired:
+            return index - 1
+        if team not in {"ry", "bg"}:
+            raise ValueError(f"Invalid Engine 1 team: {team}")
+        return (index - 1) * 2 + (0 if team == "ry" else 1)
+
+    def contains(self, index: int, team: str) -> bool:
+        return bool(self._completed[self._slot(index, team)])
+
+    def add(self, index: int, team: str) -> bool:
+        slot = self._slot(index, team)
+        if self._completed[slot]:
+            return False
+        self._completed[slot] = 1
+        return True
+
+class SummaryAccumulator:
+    def __init__(self, games_expected: int, *, paired: bool) -> None:
+        self.games_expected = games_expected
+        self.paired = paired
+        self.games_completed = 0
+        self.engine1_wins = 0
+        self.engine2_wins = 0
+        self.draws = 0
+        self.terminations: dict[str, int] = {}
+        self.pending_pairs: dict[int, float] = {}
+        self.pairs_completed = 0
+        self.pair_mean = 0.0
+        self.pair_m2 = 0.0
+
+    def add(self, record: dict[str, Any]) -> None:
+        score = float(record.get("engine1_score", 0.5))
+        self.games_completed += 1
+        if score == 1.0:
+            self.engine1_wins += 1
+        elif score == 0.0:
+            self.engine2_wins += 1
+        else:
+            self.draws += 1
+        termination = str(record.get("termination", "unknown"))
+        self.terminations[termination] = self.terminations.get(termination, 0) + 1
+        if not self.paired:
+            return
+        pair = int(record.get("pair", record.get("game", 0)) or 0)
+        if pair < 1:
+            return
+        previous = self.pending_pairs.pop(pair, None)
+        if previous is None:
+            self.pending_pairs[pair] = score
+            return
+        pair_score = (previous + score) / 2
+        self.pairs_completed += 1
+        delta = pair_score - self.pair_mean
+        self.pair_mean += delta / self.pairs_completed
+        self.pair_m2 += delta * (pair_score - self.pair_mean)
+
+    def summary(self) -> dict[str, Any]:
+        if self.games_completed:
+            score = (
+                self.engine1_wins + self.draws / 2
+            ) / self.games_completed
+        else:
+            score = 0.5
+        if score >= 1.0:
+            elo = math.inf
+        elif score <= 0.0:
+            elo = -math.inf
+        else:
+            elo = 400 * math.log10(score / (1 - score))
+        confidence = None
+        if self.pairs_completed > 1:
+            variance = self.pair_m2 / (self.pairs_completed - 1)
+            error = math.sqrt(variance / self.pairs_completed)
+            confidence = [
+                max(0.0, self.pair_mean - 1.96 * error),
+                min(1.0, self.pair_mean + 1.96 * error),
+            ]
+        terminations = dict(self.terminations)
+        return {
+            "games_completed": self.games_completed,
+            "games_expected": self.games_expected,
+            "engine1_wins": self.engine1_wins,
+            "engine2_wins": self.engine2_wins,
+            "draws": self.draws,
+            "engine1_score": score,
+            "engine2_score": 1 - score,
+            "elo": elo,
+            "pairs_completed": self.pairs_completed,
+            "paired_95ci": confidence,
+            "engine1_illegal_moves": terminations.get("engine1_illegal_move", 0),
+            "engine2_illegal_moves": terminations.get("engine2_illegal_move", 0),
+            "engine1_time_losses": terminations.get("engine1_time_loss", 0),
+            "engine2_time_losses": terminations.get("engine2_time_loss", 0),
+            "engine1_timeouts": terminations.get("engine1_timeout", 0),
+            "engine2_timeouts": terminations.get("engine2_timeout", 0),
+            "runner_errors": terminations.get("runner_error", 0),
+            "terminations": terminations,
+        }
 
 class ActiveEngines:
     def __init__(self) -> None:
@@ -504,12 +615,10 @@ def generate_start(
     rng: random.Random,
     arbiter: UciEngine | None = None,
 ) -> StartPosition:
-    if not config.fens:
-        return StartPosition(None, [], "startpos")
-    fen = rng.choice(config.fens)
+    fen = rng.choice(config.fens) if config.fens else None
     moves: list[str] = []
     if config.opening_plies <= 0:
-        return StartPosition(fen, moves, "fen")
+        return StartPosition(fen, moves, "fen" if fen else "startpos")
     if arbiter is None:
         opening_config = config.arbiter or config.engine1
         with UciEngine(opening_config, label="opening-rules") as owned:
@@ -619,7 +728,9 @@ def play_game(
     start_turn = fen_turn_index(task.start.fen)
     record: dict[str, Any] = {
         "game_id": task.game_id,
-        "pair": task.pair_index,
+        "pair": task.pair_index if task.paired else None,
+        "game": task.pair_index,
+        "paired": task.paired,
         "engine1_team": task.engine1_team,
         "fen": task.start.fen,
         "opening": list(task.start.opening_moves),
@@ -773,7 +884,12 @@ def print_move(game_id: str, info: dict[str, Any]) -> None:
         flush=True,
     )
 
-def summarize(records: list[dict[str, Any]], games_expected: int) -> dict[str, Any]:
+def summarize(
+    records: list[dict[str, Any]],
+    games_expected: int,
+    *,
+    paired: bool = True,
+) -> dict[str, Any]:
     wins1 = sum(float(r.get("engine1_score", 0.5)) == 1.0 for r in records)
     wins2 = sum(float(r.get("engine1_score", 0.5)) == 0.0 for r in records)
     draws = len(records) - wins1 - wins2
@@ -784,15 +900,16 @@ def summarize(records: list[dict[str, Any]], games_expected: int) -> dict[str, A
         elo = -math.inf
     else:
         elo = 400 * math.log10(score / (1 - score))
-    by_id = {str(r["game_id"]): r for r in records}
     pair_scores: list[float] = []
-    for pair in range(1, games_expected // 2 + 1):
-        ry = by_id.get(f"pair{pair:04d}-ry")
-        bg = by_id.get(f"pair{pair:04d}-bg")
-        if ry and bg:
-            pair_scores.append(
-                (float(ry["engine1_score"]) + float(bg["engine1_score"])) / 2
-            )
+    if paired:
+        by_id = {str(r["game_id"]): r for r in records}
+        for pair in range(1, games_expected // 2 + 1):
+            ry = by_id.get(f"pair{pair:04d}-ry")
+            bg = by_id.get(f"pair{pair:04d}-bg")
+            if ry and bg:
+                pair_scores.append(
+                    (float(ry["engine1_score"]) + float(bg["engine1_score"])) / 2
+                )
     if len(pair_scores) > 1:
         mean = sum(pair_scores) / len(pair_scores)
         variance = sum((x - mean) ** 2 for x in pair_scores) / (len(pair_scores) - 1)
@@ -974,7 +1091,37 @@ def print_start_banner(
 def append_jsonl(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as f:
-        f.write(json.dumps(payload, sort_keys=True) + "\n")
+        f.write(json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n")
+
+def compact_training_record(record: dict[str, Any]) -> dict[str, Any]:
+    compact = {
+        key: record[key]
+        for key in (
+            "game_id",
+            "pair",
+            "game",
+            "paired",
+            "engine1_team",
+            "fen",
+            "opening",
+            "moves",
+            "result",
+            "engine1_score",
+            "termination",
+            "illegal_move",
+            "error",
+        )
+        if key in record
+    }
+    compact["searches"] = [
+        {
+            key: search[key]
+            for key in ("ply", "team", "move", "depth", "nodes", "score")
+            if key in search
+        }
+        for search in record.get("searches", [])
+    ]
+    return compact
 
 def load_jsonl(path: Path) -> list[dict[str, Any]]:
     if not path.is_file():
@@ -991,6 +1138,15 @@ def load_jsonl(path: Path) -> list[dict[str, Any]]:
             raise ValueError(f"Invalid game record in {path} line {number}")
         records.append(record)
     return records
+
+def record_index(record: dict[str, Any]) -> int:
+    raw = record.get("game", record.get("pair"))
+    if raw is not None:
+        return int(raw)
+    match = re.match(r"^(?:game|pair)(\d+)-", str(record.get("game_id", "")))
+    if match is None:
+        raise ValueError(f"Cannot determine game index: {record.get('game_id')}")
+    return int(match.group(1))
 
 def atomic_json(path: Path, payload: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -1121,7 +1277,7 @@ def write_pgn4(
     ordered = sorted(
         records,
         key=lambda record: (
-            int(record.get("pair", 0)),
+            int(record.get("game", record.get("pair", 0)) or 0),
             0 if record.get("engine1_team") == "ry" else 1,
         ),
     )
@@ -1133,29 +1289,42 @@ def write_pgn4(
     temp.write_text(text, encoding="utf-8")
     temp.replace(path)
 
+def append_pgn4(
+    path: Path,
+    record: dict[str, Any],
+    config: MatchConfig,
+    engine1_name: str,
+    engine2_name: str,
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as output:
+        output.write(
+            serialize_pgn4_game(record, config, engine1_name, engine2_name)
+        )
+
 def sidecar(path: Path, suffix: str) -> Path:
     return path.with_name(path.name + suffix)
 
 def create_schedule(
     config: MatchConfig,
-    pairs: int,
+    entries: int,
     seed: int,
     path: Path | None,
     resume: bool,
 ) -> list[StartPosition]:
     if resume and path is not None and path.is_file():
         raw = json.loads(path.read_text(encoding="utf-8"))
-        if not isinstance(raw, list) or len(raw) != pairs:
-            raise ValueError(f"Opening schedule does not contain {pairs} pairs")
+        if not isinstance(raw, list) or len(raw) != entries:
+            raise ValueError(f"Opening schedule does not contain {entries} entries")
         return [
             StartPosition(item.get("fen"), list(item["opening_moves"]), item["source"])
             for item in raw
         ]
     rng = random.Random(seed)
-    if config.opening_plies and config.fens:
+    if config.opening_plies:
         if config.arbiter is not None:
             with UciEngine(config.arbiter, label="opening-rules") as arbiter:
-                starts = [generate_start(config, rng, arbiter) for _ in range(pairs)]
+                starts = [generate_start(config, rng, arbiter) for _ in range(entries)]
         else:
             starts = []
             with UciEngine(
@@ -1167,11 +1336,11 @@ def create_schedule(
             ) as engine2_rules:
                 providers = (engine1_rules, engine2_rules)
                 first_provider = rng.randrange(2)
-                for pair_index in range(pairs):
-                    opening_engine = providers[(first_provider + pair_index) % 2]
+                for entry_index in range(entries):
+                    opening_engine = providers[(first_provider + entry_index) % 2]
                     starts.append(generate_start(config, rng, opening_engine))
     else:
-        starts = [generate_start(config, rng) for _ in range(pairs)]
+        starts = [generate_start(config, rng) for _ in range(entries)]
     if path is not None:
         atomic_json(path, [
             {
@@ -1184,6 +1353,114 @@ def create_schedule(
         ])
     return starts
 
+def iter_persistent_schedule(
+    config: MatchConfig,
+    entries: int,
+    seed: int,
+    path: Path | None,
+    *,
+    resume: bool,
+) -> Iterator[tuple[int, StartPosition]]:
+    if path is not None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+    existing = (
+        path.open(encoding="utf-8")
+        if path is not None and resume and path.is_file()
+        else None
+    )
+    output = path.open("a", encoding="utf-8") if path is not None else None
+    stack = contextlib.ExitStack()
+    providers: tuple[UciEngine, ...] | None = None
+    existing_exhausted = existing is None
+    try:
+        for index in range(1, entries + 1):
+            raw = (
+                existing.readline()
+                if existing is not None and not existing_exhausted
+                else ""
+            )
+            if not raw:
+                existing_exhausted = True
+            if raw:
+                try:
+                    item = json.loads(raw)
+                except json.JSONDecodeError as exc:
+                    raise ValueError(
+                        f"Invalid opening schedule line {index}: {path}"
+                    ) from exc
+                if int(item.get("index", index)) != index:
+                    raise ValueError(
+                        f"Opening schedule index mismatch at line {index}: {path}"
+                    )
+                start = StartPosition(
+                    item.get("fen"),
+                    list(item["opening_moves"]),
+                    str(item["source"]),
+                )
+            else:
+                rng = random.Random(f"{seed}:{index}")
+                opening_engine = None
+                if config.opening_plies:
+                    if providers is None:
+                        if config.arbiter is not None:
+                            providers = (
+                                stack.enter_context(UciEngine(
+                                    config.arbiter,
+                                    label="opening-rules",
+                                )),
+                            )
+                        else:
+                            providers = (
+                                stack.enter_context(UciEngine(
+                                    config.engine1,
+                                    label="opening-rules-engine1",
+                                )),
+                                stack.enter_context(UciEngine(
+                                    config.engine2,
+                                    label="opening-rules-engine2",
+                                )),
+                            )
+                    opening_engine = providers[(index - 1) % len(providers)]
+                start = generate_start(config, rng, opening_engine)
+                if output is not None:
+                    output.write(json.dumps({
+                        "index": index,
+                        "fen": start.fen,
+                        "opening_moves": start.opening_moves,
+                        "source": start.source,
+                    }, separators=(",", ":")) + "\n")
+                    output.flush()
+            yield index, start
+        if (
+            existing is not None
+            and not existing_exhausted
+            and existing.readline()
+        ):
+            raise ValueError(
+                f"Opening schedule contains more than {entries} entries: {path}"
+            )
+    finally:
+        stack.close()
+        if output is not None:
+            output.close()
+        if existing is not None:
+            existing.close()
+
+def iter_tasks(
+    starts: Iterable[tuple[int, StartPosition]],
+    completed: CompletionTracker,
+    *,
+    paired: bool,
+) -> Iterator[GameTask]:
+    for index, start in starts:
+        if paired:
+            team_order = ("ry", "bg") if index % 2 else ("bg", "ry")
+        else:
+            team_order = ("ry",) if index % 2 else ("bg",)
+        for team in team_order:
+            if not completed.contains(index, team):
+                yield GameTask(index, team, start, paired)
+
 def validate_engine(config: EngineConfig, label: str) -> None:
     if not config.path.is_file():
         raise ValueError(f"{label} does not exist: {config.path}")
@@ -1193,21 +1470,26 @@ def validate_engine(config: EngineConfig, label: str) -> None:
 def build_tasks(
     starts: list[StartPosition],
     records_by_id: dict[str, dict[str, Any]] | None = None,
+    *,
+    paired: bool = True,
 ) -> list[GameTask]:
     completed = records_by_id or {}
     tasks: list[GameTask] = []
-    for pair, start in enumerate(starts, 1):
-        team_order = ("ry", "bg") if pair % 2 else ("bg", "ry")
+    for index, start in enumerate(starts, 1):
+        if paired:
+            team_order = ("ry", "bg") if index % 2 else ("bg", "ry")
+        else:
+            team_order = ("ry",) if index % 2 else ("bg",)
         for team in team_order:
-            task = GameTask(pair, team, start)
+            task = GameTask(index, team, start, paired)
             if task.game_id not in completed:
                 tasks.append(task)
     return tasks
 
 def execute_tasks(
     config: MatchConfig,
-    tasks: list[GameTask],
-    records_by_id: dict[str, dict[str, Any]],
+    tasks: Iterable[GameTask],
+    records_by_id: dict[str, dict[str, Any]] | None,
     *,
     continue_on_error: bool,
     on_record: Any = None,
@@ -1220,30 +1502,54 @@ def execute_tasks(
 
     executor = concurrent.futures.ThreadPoolExecutor(max_workers=config.workers)
     futures: dict[concurrent.futures.Future[dict[str, Any]], GameTask] = {}
-    try:
-        futures = {executor.submit(run_task, task): task for task in tasks}
-        for future in concurrent.futures.as_completed(futures):
-            task = futures[future]
-            try:
-                record = future.result()
-            except Exception as exc:
-                if not continue_on_error:
-                    raise
-                record = {
-                    "game_id": task.game_id,
-                    "pair": task.pair_index,
-                    "engine1_team": task.engine1_team,
-                    "fen": task.start.fen,
-                    "opening": task.start.opening_moves,
-                    "moves": task.start.opening_moves,
-                    "result": "draw",
-                    "engine1_score": 0.5,
-                    "termination": "runner_error",
-                    "error": f"{type(exc).__name__}: {exc}",
-                }
+    task_iterator = iter(tasks)
+
+    def submit_next() -> bool:
+        try:
+            task = next(task_iterator)
+        except StopIteration:
+            return False
+        futures[executor.submit(run_task, task)] = task
+        return True
+
+    def save_record(task: GameTask, future: concurrent.futures.Future[dict[str, Any]]) -> None:
+        try:
+            record = future.result()
+        except Exception as exc:
+            if not continue_on_error:
+                raise
+            record = {
+                "game_id": task.game_id,
+                "pair": task.pair_index if task.paired else None,
+                "game": task.pair_index,
+                "paired": task.paired,
+                "engine1_team": task.engine1_team,
+                "fen": task.start.fen,
+                "opening": task.start.opening_moves,
+                "moves": task.start.opening_moves,
+                "result": "draw",
+                "engine1_score": 0.5,
+                "termination": "runner_error",
+                "error": f"{type(exc).__name__}: {exc}",
+            }
+        if records_by_id is not None:
             records_by_id[task.game_id] = record
-            if on_record is not None:
-                on_record(record, records_by_id)
+        if on_record is not None:
+            on_record(record, records_by_id)
+
+    try:
+        for _ in range(max(config.workers, config.workers * 2)):
+            if not submit_next():
+                break
+        while futures:
+            done, _ = concurrent.futures.wait(
+                futures,
+                return_when=concurrent.futures.FIRST_COMPLETED,
+            )
+            for future in done:
+                task = futures.pop(future)
+                save_record(task, future)
+                submit_next()
     except KeyboardInterrupt:
         stop_event.set()
         for future in futures:
@@ -1290,7 +1596,7 @@ def play_match(
     )
     records = list(records_by_id.values())
     name1, name2 = engine_names(records, config.engine1, config.engine2)
-    summary = summarize(records, pairs * 2)
+    summary = summarize(records, pairs * 2, paired=True)
     summary["engine1_name"] = name1
     summary["engine2_name"] = name2
     return MatchResult(records, summary, name1, name2, interrupted)
@@ -1334,10 +1640,10 @@ def run_match(args: argparse.Namespace) -> int:
         validate_rules_commands(arbiter, "Arbiter", require_game_result=True)
 
     metadata_path = sidecar(out, ".meta.json") if out is not None else None
-    schedule_path = sidecar(out, ".schedule.json") if out is not None else None
+    schedule_path = sidecar(out, ".schedule.jsonl") if out is not None else None
     summary_path = sidecar(out, ".summary.json") if out is not None else None
     payload = {
-        "format": 1,
+        "format": 2,
         "engine1": engine_signature(engine1),
         "engine2": engine_signature(engine2),
         "arbiter": engine_signature(arbiter) if arbiter is not None else "current_engine",
@@ -1351,13 +1657,17 @@ def run_match(args: argparse.Namespace) -> int:
         "max_plies": args.max_plies,
         "opening_plies": args.opening_plies,
         "fens": config.fens,
+        "training_output": args.training_output,
     }
+    if not args.paired:
+        payload["mode"] = "unpaired"
+        payload["games"] = args.game_count
     fingerprint = hashlib.sha256(
         json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
     ).hexdigest()
 
     if args.fresh and out is not None:
-        for path in (out, metadata_path, schedule_path, summary_path):
+        for path in (out, metadata_path, schedule_path, summary_path, pgn4):
             if path is not None:
                 path.unlink(missing_ok=True)
     if out is not None and out.exists() and not args.resume:
@@ -1372,71 +1682,117 @@ def run_match(args: argparse.Namespace) -> int:
     elif metadata_path is not None:
         atomic_json(metadata_path, {"fingerprint": fingerprint, "config": payload})
 
-    starts = create_schedule(
+    name1 = probe_engine_name(engine1, "engine1-probe")
+    name2 = probe_engine_name(engine2, "engine2-probe")
+    completed = CompletionTracker(args.schedule_count, paired=args.paired)
+    stats = SummaryAccumulator(args.game_count, paired=args.paired)
+    resume_existing = (
+        out is not None and out.is_file() and args.resume and not args.fresh
+    )
+    resume_schedule = (
+        schedule_path is not None
+        and schedule_path.is_file()
+        and args.resume
+        and not args.fresh
+    )
+    pgn_temp = (
+        pgn4.with_suffix(pgn4.suffix + ".tmp")
+        if pgn4 is not None and resume_existing
+        else None
+    )
+    pgn_rebuild = None
+    if pgn_temp is not None:
+        pgn_temp.parent.mkdir(parents=True, exist_ok=True)
+        pgn_rebuild = pgn_temp.open("w", encoding="utf-8")
+    try:
+        if resume_existing and out is not None:
+            with out.open(encoding="utf-8") as rows:
+                for line_number, raw in enumerate(rows, 1):
+                    if not raw.strip():
+                        continue
+                    try:
+                        record = json.loads(raw)
+                    except json.JSONDecodeError as exc:
+                        raise ValueError(
+                            f"Invalid JSON in {out} line {line_number}"
+                        ) from exc
+                    index = record_index(record)
+                    team = str(record.get("engine1_team", ""))
+                    if not completed.add(index, team):
+                        continue
+                    stats.add(record)
+                    if pgn_rebuild is not None:
+                        pgn_rebuild.write(
+                            serialize_pgn4_game(
+                                record, config, name1, name2
+                            )
+                        )
+    finally:
+        if pgn_rebuild is not None:
+            pgn_rebuild.close()
+    if pgn_temp is not None and pgn4 is not None:
+        pgn_temp.replace(pgn4)
+    elif pgn4 is not None:
+        pgn4.parent.mkdir(parents=True, exist_ok=True)
+        pgn4.write_text("", encoding="utf-8")
+
+    print_start_banner(config, args.game_count, name1, name2)
+    if stats.games_completed:
+        print(
+            f"Resuming with {stats.games_completed} completed games.",
+            flush=True,
+        )
+    starts = iter_persistent_schedule(
         config,
-        args.pairs,
+        args.schedule_count,
         args.seed,
         schedule_path,
-        out is not None and args.resume and not args.fresh,
+        resume=resume_schedule,
     )
-    records = (
-        load_jsonl(out)
-        if out is not None and args.resume and not args.fresh
-        else []
-    )
-    records_by_id = {str(record["game_id"]): record for record in records}
-    if records:
-        name1, name2 = engine_names(records, engine1, engine2)
-    else:
-        name1 = probe_engine_name(engine1, "engine1-probe")
-        name2 = probe_engine_name(engine2, "engine2-probe")
-    if pgn4 is not None:
-        write_pgn4(pgn4, list(records_by_id.values()), config, name1, name2)
-    print_start_banner(config, args.pairs * 2, name1, name2)
-    tasks = build_tasks(starts, records_by_id)
+    tasks = iter_tasks(starts, completed, paired=args.paired)
 
     def on_record(
         record: dict[str, Any],
-        current_by_id: dict[str, dict[str, Any]],
+        _current_by_id: dict[str, dict[str, Any]] | None,
     ) -> None:
-        if out is not None:
-            append_jsonl(out, record)
-        current_records = list(current_by_id.values())
-        summary = summarize(current_records, args.pairs * 2)
-        current_name1, current_name2 = engine_names(
-            current_records, engine1, engine2
+        index = record_index(record)
+        team = str(record.get("engine1_team", ""))
+        if not completed.add(index, team):
+            return
+        persisted = (
+            compact_training_record(record)
+            if args.training_output
+            else record
         )
-        summary["engine1_name"] = current_name1
-        summary["engine2_name"] = current_name2
-        if summary_path is not None:
+        if out is not None:
+            append_jsonl(out, persisted)
+        stats.add(record)
+        summary = stats.summary()
+        summary["engine1_name"] = name1
+        summary["engine2_name"] = name2
+        if (
+            summary_path is not None
+            and stats.games_completed % args.summary_interval == 0
+        ):
             atomic_json(summary_path, summary)
         if pgn4 is not None:
-            write_pgn4(
-                pgn4,
-                current_records,
-                config,
-                current_name1,
-                current_name2,
-            )
+            append_pgn4(pgn4, record, config, name1, name2)
         if not args.quiet:
-            print_summary(summary, current_name1, current_name2, record)
+            print_summary(summary, name1, name2, record)
 
     interrupted = execute_tasks(
         config,
         tasks,
-        records_by_id,
+        None,
         continue_on_error=args.continue_on_error,
         on_record=on_record,
     )
+    summary = stats.summary()
+    summary["engine1_name"] = name1
+    summary["engine2_name"] = name2
+    if summary_path is not None:
+        atomic_json(summary_path, summary)
     if interrupted:
-        interrupted_records = list(records_by_id.values())
-        summary = summarize(interrupted_records, args.pairs * 2)
-        if interrupted_records:
-            name1, name2 = engine_names(interrupted_records, engine1, engine2)
-        summary["engine1_name"] = name1
-        summary["engine2_name"] = name2
-        if summary_path is not None:
-            atomic_json(summary_path, summary)
         print_final_summary(summary, name1, name2, interrupted=True)
         message = (
             "Completed games are saved and can be resumed."
@@ -1447,21 +1803,13 @@ def run_match(args: argparse.Namespace) -> int:
             print(message, file=sys.stderr)
         return 130
 
-    final_records = list(records_by_id.values())
-    summary = summarize(final_records, args.pairs * 2)
-    if final_records:
-        name1, name2 = engine_names(final_records, engine1, engine2)
-    summary["engine1_name"] = name1
-    summary["engine2_name"] = name2
-    if summary_path is not None:
-        atomic_json(summary_path, summary)
     print_final_summary(summary, name1, name2, interrupted=False)
     return 0
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Run paired matches between two 4PC UCI engines"
+        description="Run matches between two 4PC UCI engines"
     )
     parser.add_argument("--engine1", "--e1", required=True, help="first engine executable")
     parser.add_argument("--engine2", "--e2", required=True, help="second engine executable")
@@ -1483,7 +1831,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--arbiter-hash", type=int, default=16)
     games = parser.add_mutually_exclusive_group()
     games.add_argument("--pairs", type=int, help="paired openings; two games each")
-    games.add_argument("--games", type=int, help="total games; must be even")
+    games.add_argument("--games", type=int, help="total games")
+    parser.add_argument(
+        "--unpaired",
+        action="store_true",
+        help="run independent games; requires --games and allows odd counts",
+    )
     parser.add_argument("--workers", type=int, default=1)
     limit = parser.add_mutually_exclusive_group()
     limit.add_argument("--nodes", type=int)
@@ -1501,6 +1854,17 @@ def build_parser() -> argparse.ArgumentParser:
         "--out",
         default="",
         help="optional JSONL output path; enables persistence and resume",
+    )
+    parser.add_argument(
+        "--training-output",
+        action="store_true",
+        help="write compact NNUE-ready JSONL records",
+    )
+    parser.add_argument(
+        "--summary-interval",
+        type=int,
+        default=100,
+        help="update the summary file every N completed games",
     )
     parser.add_argument(
         "--pgn4",
@@ -1521,11 +1885,31 @@ def main() -> int:
     parser = build_parser()
     args = parser.parse_args()
     if args.games is not None:
-        if args.games < 2 or args.games % 2:
-            parser.error("--games must be an even number of at least 2")
-        args.pairs = args.games // 2
+        if args.games < 1:
+            parser.error("--games must be at least 1")
+        if args.unpaired:
+            args.paired = False
+            args.pairs = None
+            args.game_count = args.games
+            args.schedule_count = args.games
+        else:
+            if args.games < 2 or args.games % 2:
+                parser.error("--games must be an even number of at least 2 unless --unpaired is used")
+            args.paired = True
+            args.pairs = args.games // 2
+            args.game_count = args.games
+            args.schedule_count = args.pairs
+    elif args.unpaired:
+        parser.error("--unpaired requires --games")
     elif args.pairs is None:
+        args.paired = True
         args.pairs = 1
+        args.game_count = 2
+        args.schedule_count = 1
+    else:
+        args.paired = True
+        args.game_count = args.pairs * 2
+        args.schedule_count = args.pairs
     if args.tc is not None:
         args.limit_kind = "clock"
         args.limit_value = 0
@@ -1541,10 +1925,14 @@ def main() -> int:
         args.limit_kind = "nodes"
         args.limit_value = args.nodes if args.nodes is not None else 10000
         args.tc = 0
-    if args.pairs < 1:
+    if args.paired and args.pairs < 1:
         parser.error("--pairs must be at least 1")
     if args.workers < 1 or args.threads1 < 1 or args.threads2 < 1:
         parser.error("worker and engine thread counts must be at least 1")
+    if args.summary_interval < 1:
+        parser.error("--summary-interval must be at least 1")
+    if args.training_output and not args.out:
+        parser.error("--training-output requires --out")
     if args.limit_kind == "clock" and args.tc <= 0:
         parser.error("--tc must be greater than 0")
     if args.limit_kind != "clock" and args.inc:
