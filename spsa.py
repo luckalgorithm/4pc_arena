@@ -11,11 +11,21 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
-from match import EngineConfig, MatchConfig, load_fens, load_options, play_match
+from match import (
+    EngineConfig,
+    EngineError,
+    MatchConfig,
+    load_fens,
+    load_options,
+    play_match,
+)
 
 
 DEFAULT_ALPHA = 0.602
 DEFAULT_GAMMA = 0.101
+MAX_HISTORY_ENTRIES = 5000
+PARAMETER_HISTORY_INTERVAL = 100
+MAX_PARAMETER_HISTORY_ENTRIES = 500
 
 
 @dataclass
@@ -58,11 +68,8 @@ def clip(value: float, minimum: float, maximum: float) -> float:
     return min(max(value, minimum), maximum)
 
 
-def option_value(value: float) -> int | str:
-    rounded = round(value)
-    if abs(value - rounded) < 1.0e-9:
-        return int(rounded)
-    return f"{value:.10g}"
+def option_value(value: float) -> int:
+    return int(round(value))
 
 
 def parse_parameters(
@@ -134,9 +141,60 @@ def write_state(path: Path, state: dict[str, Any]) -> None:
     tmp.replace(path)
 
 
+def compact_state_history(
+    state: dict[str, Any],
+) -> tuple[int, list[dict[str, Any]], list[dict[str, Any]]]:
+    raw_history = list(state.get("history", []))
+    updates_completed = int(state.get("updates_completed", len(raw_history)))
+
+    parameter_history = list(state.get("parameter_history", []))
+    if not parameter_history:
+        first_update = updates_completed - len(raw_history)
+        for index, entry in enumerate(raw_history, 1):
+            update_number = first_update + index
+            saved_params = entry.get("parameters")
+            if (
+                update_number % PARAMETER_HISTORY_INTERVAL == 0
+                and isinstance(saved_params, list)
+            ):
+                parameter_history.append(
+                    {
+                        "iteration": int(entry["iteration"]),
+                        "theta": {
+                            str(param["name"]): float(param["theta"])
+                            for param in saved_params
+                        },
+                    }
+                )
+
+    history = [
+        {
+            "iteration": int(entry["iteration"]),
+            "pairs": int(entry["pairs"]),
+            "result": int(entry["result"]),
+            "summary": entry["summary"],
+        }
+        for entry in raw_history[-MAX_HISTORY_ENTRIES:]
+    ]
+    parameter_history = parameter_history[-MAX_PARAMETER_HISTORY_ENTRIES:]
+
+    state["format"] = 2
+    state["updates_completed"] = updates_completed
+    state["history"] = history
+    state["parameter_history"] = parameter_history
+    return updates_completed, history, parameter_history
+
+
 def write_text(path: Path, text: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(text, encoding="utf-8")
+
+
+def write_export(target: str, text: str) -> None:
+    if target == "-":
+        print(text, end="")
+    else:
+        write_text(Path(target), text)
 
 
 def restore_parameters(params: list[Parameter], state: dict[str, Any]) -> int:
@@ -230,6 +288,193 @@ def rounded_theta(param: dict[str, Any]) -> int:
     return int(clip(value, float(param["minimum"]), float(param["maximum"])))
 
 
+def export_constexpr_block(params: list[dict[str, Any]], source: str, iteration: Any) -> str:
+    values = {str(param["name"]): rounded_theta(param) for param in params}
+    indent = "  "
+
+    def value(name: str, default: int) -> int:
+        return values.get(name, default)
+
+    def score(mg: int, eg: int) -> str:
+        return f"S({mg:>4},{eg:>4})"
+
+    def line(text: str = "") -> str:
+        return indent + text if text else ""
+
+    mobility_mg = [
+        [-62, -53, -12, -4, 3, 13, 22, 28, 33],
+        [-48, -20, 16, 26, 38, 51, 55, 63, 63, 68, 81, 81, 91, 98],
+        [-58, -27, -15, -10, -5, -2, 9, 16, 30, 29, 32, 38, 46, 48, 58],
+        [-39, -21, 3, 3, 14, 22, 28, 41, 43, 48, 56, 60, 60, 66, 67, 70,
+         71, 73, 79, 88, 88, 99, 102, 102, 106, 109, 113, 116],
+    ]
+    mobility_eg = [
+        [-81, -56, -30, -14, 8, 15, 23, 27, 33],
+        [-59, -23, -3, 13, 24, 42, 54, 57, 65, 73, 78, 86, 88, 97],
+        [-76, -18, 28, 55, 69, 82, 112, 118, 132, 142, 155, 165, 166, 169, 171],
+        [-36, -15, 8, 18, 34, 54, 61, 73, 79, 92, 94, 104, 113, 120, 123, 126,
+         133, 136, 140, 143, 148, 166, 170, 175, 184, 191, 206, 212],
+    ]
+
+    lines = [
+        line("#define S(mg, eg) make_score(mg, eg)"),
+        "",
+        line(f"// Exported from {source} at iteration {iteration}"),
+        line("constexpr Score MobilityBonus[4][32] = {"),
+    ]
+    for piece, (mg_row, eg_row) in enumerate(zip(mobility_mg, mobility_eg)):
+        entries = [
+            score(
+                value(f"MobilityBonusMg[{piece}][{idx}]", mg),
+                value(f"MobilityBonusEg[{piece}][{idx}]", eg),
+            )
+            for idx, (mg, eg) in enumerate(zip(mg_row, eg_row))
+        ]
+        lines.append(line("  { " + ", ".join(entries) + " },"))
+    lines.append(line("};"))
+    lines.append("")
+
+    rook_mg = [value("RookOnFileMg[0]", 32), value("RookOnFileMg[1]", 71)]
+    rook_eg = [value("RookOnFileEg[0]", 6), value("RookOnFileEg[1]", 38)]
+    lines.append(
+        line("constexpr Score RookOnFile[] = { "
+        + ", ".join(score(mg, eg) for mg, eg in zip(rook_mg, rook_eg))
+        + " };")
+    )
+    lines.append("")
+
+    weights = [0, 0] + [
+        value(f"KingAttackWeights[{idx}]", default)
+        for idx, default in enumerate([81, 52, 44, 10], 2)
+    ]
+    lines.append(
+        line("constexpr int KingAttackWeights[PIECE_TYPE_NB] = { "
+        + ", ".join(str(v) for v in weights)
+        + " };")
+    )
+    lines.append("")
+
+    lines.append(
+        line("constexpr Score KingProtector = "
+        + score(value("KingProtectorMg", 7), value("KingProtectorEg", 8))
+        + ";")
+    )
+    lines.append(
+        line("constexpr Score KingInCheckPenalty = "
+        + score(value("KingInCheckPenaltyMg", 250), value("KingInCheckPenaltyEg", 40))
+        + ";")
+    )
+    lines.append("")
+
+    threat_minor_mg = [0, 6, 59, 79, 90, 79, 0, 0]
+    threat_minor_eg = [0, 32, 41, 56, 119, 161, 0, 0]
+    threat_rook_mg = [0, 3, 38, 38, 0, 51, 0, 0]
+    threat_rook_eg = [0, 44, 71, 61, 38, 38, 0, 0]
+
+    def score_array(name: str, mg_defaults: list[int], eg_defaults: list[int]) -> None:
+        entries = [
+            score(
+                value(f"{name}Mg[{idx}]", mg),
+                value(f"{name}Eg[{idx}]", eg),
+            )
+            for idx, (mg, eg) in enumerate(zip(mg_defaults, eg_defaults))
+        ]
+        lines.append(line(f"constexpr Score {name}[PIECE_TYPE_NB] = {{"))
+        lines.append(line("  " + ", ".join(entries)))
+        lines.append(line("};"))
+        lines.append("")
+
+    score_array("ThreatByMinor", threat_minor_mg, threat_minor_eg)
+    score_array("ThreatByRook", threat_rook_mg, threat_rook_eg)
+
+    pawn_mg = [[48, 64], [72, 96], [120, 160]]
+    pawn_eg = [[32, 48], [48, 64], [80, 110]]
+    lines.append(line("constexpr Score PawnThreat[3][2] = {"))
+    for piece_class, (mg_row, eg_row) in enumerate(zip(pawn_mg, pawn_eg)):
+        entries = [
+            score(
+                value(f"PawnThreatMg[{piece_class}][{idx}]", mg),
+                value(f"PawnThreatEg[{piece_class}][{idx}]", eg),
+            )
+            for idx, (mg, eg) in enumerate(zip(mg_row, eg_row))
+        ]
+        comma = "," if piece_class != len(pawn_mg) - 1 else ""
+        lines.append(line("  { " + ", ".join(entries) + " }" + comma))
+    lines.append(line("};"))
+    lines.append("")
+
+    lines.append(
+        line("constexpr Score Hanging = "
+        + score(value("HangingMg", 69), value("HangingEg", 36))
+        + ";")
+    )
+    lines.append("")
+
+    scalar_defaults = [
+        ("KingAttackCountWeight", 69),
+        ("MultiColorAttackPenalty", 150),
+        ("WeakKingRingPenalty", 80),
+        ("UndefendedKingRingPenalty", 100),
+        ("RookCheckPenalty", 1080),
+        ("QueenCheckPenalty", 780),
+        ("BishopCheckPenalty", 635),
+        ("KnightCheckPenalty", 790),
+        ("UnsafeCheckPenalty", 148),
+        ("NoPawnShieldPenalty", 120),
+        ("WeakPawnShieldPenalty", 40),
+        ("NoQueenSafetyReduction", 873),
+        ("DangerThreshold", 100),
+        ("DangerDivisor", 4096),
+        ("DangerMaxPenalty", 1000),
+        ("SafetyEgDivisor", 16),
+        ("MidgameLimit", 30516),
+        ("EndgameLimit", 7830),
+    ]
+    for name, default in scalar_defaults:
+        lines.append(line(f"constexpr int {name} = {value(name, default)};"))
+
+    lines.append("")
+    lines.extend(
+        [
+            line("inline Score mobility_bonus(PieceType pt, int mob) {"),
+            line("    const int max_idx[] = {8, 13, 14, 27};"),
+            line("    return MobilityBonus[pt - KNIGHT][std::min(mob, max_idx[pt - KNIGHT])];"),
+            line("}"),
+            "",
+            line("inline Score rook_on_file_bonus(bool open) {"),
+            line("    return RookOnFile[open];"),
+            line("}"),
+            "",
+            line("inline Score king_protector_bonus() {"),
+            line("    return KingProtector;"),
+            line("}"),
+            "",
+            line("inline Score king_in_check_penalty() {"),
+            line("    return KingInCheckPenalty;"),
+            line("}"),
+            "",
+            line("inline Score threat_by_minor(PieceType pt) {"),
+            line("    return ThreatByMinor[pt];"),
+            line("}"),
+            "",
+            line("inline Score threat_by_rook(PieceType pt) {"),
+            line("    return ThreatByRook[pt];"),
+            line("}"),
+            "",
+            line("inline Score pawn_threat_bonus(int pieceClass, bool weak) {"),
+            line("    return PawnThreat[pieceClass][weak];"),
+            line("}"),
+            "",
+            line("inline Score hanging_bonus() {"),
+            line("    return Hanging;"),
+            line("}"),
+            "",
+            line("#undef S"),
+        ]
+    )
+    return "\n".join(lines) + "\n"
+
+
 def export_state(args: argparse.Namespace) -> int:
     state = load_state(Path(args.state))
     if not state:
@@ -251,16 +496,26 @@ def export_state(args: argparse.Namespace) -> int:
             f"{int(float(param['maximum']))},{float(param['c_end']):.6g},"
             f"{float(param['r_end']):.6g}"
         )
-        cxx_lines.append(f'    TuneResults["{cxx_string(name)}"] = {value};')
+        cxx_lines.append(f'    tune_results()["{cxx_string(name)}"] = {value};')
     cxx_lines.append("}")
 
     if args.params_out:
-        write_text(Path(args.params_out), "\n".join(params_lines) + "\n")
+        write_export(args.params_out, "\n".join(params_lines) + "\n")
     if args.cxx_out:
-        write_text(Path(args.cxx_out), "\n".join(cxx_lines) + "\n")
-    if not args.params_out and not args.cxx_out:
+        write_export(args.cxx_out, "\n".join(cxx_lines) + "\n")
+    if args.constexpr_out:
+        write_export(
+            args.constexpr_out,
+            export_constexpr_block(params, args.state, state.get("iteration", 0)),
+        )
+    wrote_stdout = (
+        args.params_out == "-"
+        or args.cxx_out == "-"
+        or args.constexpr_out == "-"
+    )
+    if not args.params_out and not args.cxx_out and not args.constexpr_out:
         print("\n".join(cxx_lines))
-    else:
+    elif not wrote_stdout:
         print(
             f"Exported {len(params)} params from iteration "
             f"{state.get('iteration', 0)}"
@@ -327,14 +582,14 @@ def run_spsa(args: argparse.Namespace) -> int:
     )
     state_path = Path(args.state)
     state = load_state(state_path) if args.resume else {}
+    updates_completed, history, parameter_history = compact_state_history(state)
     start_iteration = restore_parameters(params, state)
     if start_iteration >= args.iterations:
         print("SPSA already complete.")
         return 0
 
-    history = list(state.get("history", []))
     rng = random.Random(args.seed)
-    for _ in range(len(history)):
+    for _ in range(updates_completed):
         for _param in params:
             rng.choice((-1, 1))
 
@@ -371,29 +626,42 @@ def run_spsa(args: argparse.Namespace) -> int:
         result = result_from_summary(summary)
         update_parameters(params, steps, result)
         iteration += batch_pairs
+        updates_completed += 1
 
         entry = {
             "iteration": iteration,
             "pairs": batch_pairs,
             "result": result,
             "summary": summary,
-            "steps": [asdict(step) for step in steps],
-            "parameters": [asdict(param) for param in params],
         }
         history.append(entry)
+        if len(history) > MAX_HISTORY_ENTRIES:
+            del history[:-MAX_HISTORY_ENTRIES]
+        if updates_completed % PARAMETER_HISTORY_INTERVAL == 0:
+            parameter_history.append(
+                {
+                    "iteration": iteration,
+                    "theta": {param.name: param.theta for param in params},
+                }
+            )
+            if len(parameter_history) > MAX_PARAMETER_HISTORY_ENTRIES:
+                del parameter_history[:-MAX_PARAMETER_HISTORY_ENTRIES]
+
         state = {
-            "format": 1,
+            "format": 2,
             "started_at": started_at,
             "updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             "iteration": iteration,
             "iterations": args.iterations,
             "pairs": args.pairs,
+            "updates_completed": updates_completed,
             "seed": args.seed,
             "alpha": args.alpha,
             "gamma": args.gamma,
             "A": args.a,
             "parameters": [asdict(param) for param in params],
             "history": history,
+            "parameter_history": parameter_history,
         }
         write_state(state_path, state)
 
@@ -491,6 +759,11 @@ def build_export_parser() -> argparse.ArgumentParser:
         default="",
         help="write rounded params file for continuing/testing",
     )
+    parser.add_argument(
+        "--constexpr-out",
+        default="",
+        help="write constexpr evaluate.cpp parameter block",
+    )
     return parser
 
 
@@ -552,7 +825,7 @@ def main() -> int:
             file=sys.stderr,
         )
         return 130
-    except (OSError, ValueError, TimeoutError) as exc:
+    except (OSError, ValueError, TimeoutError, EngineError) as exc:
         print(f"spsa: error: {exc}", file=sys.stderr)
         return 2
 

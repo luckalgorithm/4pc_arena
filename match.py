@@ -290,7 +290,17 @@ class UciEngine:
         try:
             for raw in self.proc.stdout:
                 line = raw.strip()
-                if line:
+                if not line:
+                    continue
+                # Some 4PC builds print the final option line and uciok without
+                # an intervening newline. Split the sentinel so startup does not
+                # wait until the UCI handshake timeout expires.
+                if line != "uciok" and line.endswith("uciok"):
+                    option_line = line[: -len("uciok")].strip()
+                    if option_line:
+                        self._queue.put(option_line)
+                    self._queue.put("uciok")
+                else:
                     self._queue.put(line)
         finally:
             self._queue.put(None)
@@ -341,6 +351,10 @@ class UciEngine:
             line = self.read_line(remaining)
             if line.startswith("info string invalid command:"):
                 raise EngineError(f"{self.label} rejected command: {line}")
+            if line.startswith("Unknown command:"):
+                raise EngineError(f"{self.label} rejected command: {line}")
+            if line.startswith("No such option:"):
+                raise EngineError(f"{self.label} rejected option: {line}")
             if line.startswith(prefix):
                 return line
 
