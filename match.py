@@ -31,6 +31,10 @@ TEAM_BY_COLOR = {
 class EngineError(RuntimeError):
     pass
 
+
+class EngineOptionError(EngineError):
+    """The engine does not support an option required by the match."""
+
 class MatchInterrupted(RuntimeError):
     pass
 
@@ -76,6 +80,11 @@ class MatchConfig:
     workers: int
     show_moves: bool
     out: Path | None
+    opening_nodes: int = 0
+    opening_weights: tuple[float, ...] = (60.0, 30.0, 10.0)
+    opening_max_score: int = 1000
+    opening_attempts: int = 100
+    pgn4_single_line: bool = False
 
 @dataclass
 class SearchResult:
@@ -270,6 +279,17 @@ class UciEngine:
             self._reader.start()
             self.send("uci")
             self._wait_for_uciok(30)
+            available_options = {name.casefold() for name in self.uci_options}
+            missing_options = sorted(
+                name
+                for name in config.options
+                if name.casefold() not in available_options
+            )
+            if missing_options:
+                missing = ", ".join(missing_options)
+                raise EngineOptionError(
+                    f"{self.label} does not expose required UCI option(s): {missing}"
+                )
             self.send(f"setoption name Hash value {config.hash_mb}")
             self.send(f"setoption name Threads value {config.threads}")
             for name, value in sorted(config.options.items()):
@@ -354,7 +374,7 @@ class UciEngine:
             if line.startswith("Unknown command:"):
                 raise EngineError(f"{self.label} rejected command: {line}")
             if line.startswith("No such option:"):
-                raise EngineError(f"{self.label} rejected option: {line}")
+                raise EngineOptionError(f"{self.label} rejected option: {line}")
             if line.startswith(prefix):
                 return line
 
@@ -459,6 +479,57 @@ class UciEngine:
                 elapsed = int(round((time.monotonic() - started) * 1000))
                 return SearchResult(move, info, elapsed)
 
+    def search_multipv(
+        self,
+        moves: list[str],
+        fen: str | None,
+        go_command: str,
+        timeout: float,
+    ) -> list[SearchResult]:
+        self.set_position(moves, fen)
+        started = time.monotonic()
+        self.send(go_command)
+        deadline = started + timeout
+        infos: dict[int, dict[str, Any]] = {}
+        bestmove: str | None = None
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                try:
+                    self.send("stop")
+                except (BrokenPipeError, OSError, EngineError):
+                    pass
+                raise TimeoutError(f"{self.label} MultiPV search timed out")
+            try:
+                line = self.read_line(min(remaining, 1.0))
+            except TimeoutError:
+                continue
+            if line.startswith("info string Game completed."):
+                return []
+            if line.startswith("info "):
+                parsed = parse_info(line)
+                pv_index = int(parsed.get("multipv", 1))
+                infos.setdefault(pv_index, {}).update(parsed)
+            elif line.startswith("bestmove"):
+                parts = line.split()
+                if len(parts) > 1 and parts[1] not in {"(none)", "0000"}:
+                    bestmove = canonical_move(parts[1])
+                break
+
+        elapsed = int(round((time.monotonic() - started) * 1000))
+        results: list[SearchResult] = []
+        for pv_index in sorted(infos):
+            info = infos[pv_index]
+            pv = info.get("pv")
+            move = canonical_move(str(pv[0])) if isinstance(pv, list) and pv else None
+            if pv_index == 1 and move is None:
+                move = bestmove
+            if move is not None:
+                results.append(SearchResult(move, info, elapsed))
+        if not results and bestmove is not None:
+            results.append(SearchResult(bestmove, {}, elapsed))
+        return results
+
     def close(self, *, force: bool = False) -> None:
         with self._close_lock:
             if self._closed and not force:
@@ -483,6 +554,18 @@ class UciEngine:
         finally:
             if self._active_engines is not None:
                 self._active_engines.remove(self)
+            for stream in (self.proc.stdin, self.proc.stdout, self.proc.stderr):
+                if stream is not None:
+                    try:
+                        stream.close()
+                    except OSError:
+                        pass
+            if (
+                hasattr(self, "_reader")
+                and self._reader.is_alive()
+                and threading.current_thread() is not self._reader
+            ):
+                self._reader.join(timeout=0.5)
 
 def option_text(value: int | bool | str) -> str:
     if isinstance(value, bool):
@@ -543,7 +626,7 @@ def parse_info(line: str) -> dict[str, Any]:
     i = 1
     while i < len(parts):
         key = parts[i]
-        if key in {"depth", "seldepth", "nodes", "nps", "hashfull", "time"} and i + 1 < len(parts):
+        if key in {"depth", "seldepth", "multipv", "nodes", "nps", "hashfull", "time"} and i + 1 < len(parts):
             try:
                 info[key] = int(parts[i + 1])
             except ValueError:
@@ -558,7 +641,7 @@ def parse_info(line: str) -> dict[str, Any]:
         elif key == "pv":
             end = i + 1
             while end < len(parts) and parts[end] not in {
-                "depth", "seldepth", "nodes", "nps", "hashfull", "time", "score"
+                "depth", "seldepth", "multipv", "nodes", "nps", "hashfull", "time", "score"
             }:
                 end += 1
             info["pv"] = parts[i + 1 : end]
@@ -578,6 +661,17 @@ def parse_option_value(value: Any) -> int | bool | str:
         return int(text)
     except ValueError:
         return text
+
+def parse_opening_weights(value: str) -> tuple[float, ...]:
+    try:
+        weights = tuple(float(part.strip()) for part in value.split(","))
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            "opening weights must be comma-separated numbers"
+        ) from exc
+    if not weights or any(not math.isfinite(weight) or weight <= 0 for weight in weights):
+        raise argparse.ArgumentTypeError("opening weights must all be positive")
+    return weights
 
 def load_options(path: str, overrides: list[str]) -> dict[str, int | bool | str]:
     values: dict[str, int | bool | str] = {}
@@ -624,25 +718,121 @@ def engine_signature(config: EngineConfig) -> dict[str, Any]:
         "threads": config.threads,
     }
 
+def opening_search_config(config: EngineConfig, multipv: int) -> EngineConfig:
+    options = {
+        name: value
+        for name, value in config.options.items()
+        if name.casefold() != "multipv"
+    }
+    options["MultiPV"] = multipv
+    return EngineConfig(config.path, options, config.hash_mb, config.threads)
+
+def opening_score_is_extreme(info: dict[str, Any], max_score: int) -> bool:
+    if max_score <= 0:
+        return False
+    score = info.get("score")
+    if not isinstance(score, dict):
+        return False
+    if score.get("type") == "mate":
+        return True
+    try:
+        return abs(int(score["value"])) > max_score
+    except (KeyError, TypeError, ValueError):
+        return False
+
 def generate_start(
     config: MatchConfig,
     rng: random.Random,
-    arbiter: UciEngine | None = None,
+    opening_engine: UciEngine | None = None,
+    rules_engine: UciEngine | None = None,
 ) -> StartPosition:
-    fen = rng.choice(config.fens) if config.fens else None
-    moves: list[str] = []
     if config.opening_plies <= 0:
+        fen = rng.choice(config.fens) if config.fens else None
+        moves: list[str] = []
         return StartPosition(fen, moves, "fen" if fen else "startpos")
-    if arbiter is None:
+    if opening_engine is None:
         opening_config = config.arbiter or config.engine1
+        if config.opening_nodes > 0:
+            opening_config = opening_search_config(
+                config.engine1, len(config.opening_weights)
+            )
         with UciEngine(opening_config, label="opening-rules") as owned:
             return generate_start(config, rng, owned)
-    for _ in range(config.opening_plies):
-        legal = arbiter.legal_moves(moves, fen)
-        if not legal:
-            break
-        moves.append(rng.choice(legal))
-    return StartPosition(fen, moves, "fen" if fen else "startpos")
+
+    attempts = config.opening_attempts if config.opening_nodes > 0 else 1
+    for _ in range(attempts):
+        fen = rng.choice(config.fens) if config.fens else None
+        moves = []
+        rejected = False
+        for _ply in range(config.opening_plies):
+            if config.opening_nodes <= 0:
+                rules = rules_engine or opening_engine
+                legal = rules.legal_moves(moves, fen)
+                if not legal:
+                    break
+                moves.append(rng.choice(legal))
+                continue
+
+            legal = rules_engine.legal_moves(moves, fen) if rules_engine else None
+            if legal == []:
+                rejected = True
+                break
+            ranked = opening_engine.search_multipv(
+                moves,
+                fen,
+                f"go nodes {config.opening_nodes}",
+                config.timeout,
+            )
+            if not ranked:
+                rejected = True
+                break
+            if opening_score_is_extreme(ranked[0].info, config.opening_max_score):
+                rejected = True
+                break
+
+            legal_set = set(legal) if legal is not None else None
+            candidates: list[str] = []
+            weights: list[float] = []
+            for rank, result in enumerate(ranked[:len(config.opening_weights)]):
+                move = result.bestmove
+                if (
+                    move is None
+                    or (legal_set is not None and move not in legal_set)
+                    or move in candidates
+                ):
+                    continue
+                candidates.append(move)
+                weights.append(config.opening_weights[rank])
+            if not candidates:
+                raise EngineError(
+                    f"{opening_engine.label} returned no legal MultiPV opening move"
+                )
+            moves.append(rng.choices(candidates, weights=weights, k=1)[0])
+
+        if (
+            not rejected
+            and config.opening_nodes > 0
+            and config.opening_max_score > 0
+            and len(moves) == config.opening_plies
+        ):
+            final_ranked = opening_engine.search_multipv(
+                moves,
+                fen,
+                f"go nodes {config.opening_nodes}",
+                config.timeout,
+            )
+            rejected = not final_ranked or opening_score_is_extreme(
+                final_ranked[0].info, config.opening_max_score
+            )
+
+        if not rejected:
+            return StartPosition(fen, moves, "fen" if fen else "startpos")
+
+    raise EngineError(
+        "Could not generate a balanced opening after "
+        f"{attempts} attempts; increase --opening-max-score, provide more FENs, "
+        "or increase --opening-attempts"
+    )
 
 def go_command(config: MatchConfig, clocks: dict[str, int]) -> str:
     if config.limit_kind == "clock":
@@ -1099,6 +1289,24 @@ def print_start_banner(
         f"{config.workers} workers | max {config.max_plies} plies",
         flush=True,
     )
+    if config.opening_plies:
+        if config.opening_nodes > 0:
+            weights = ",".join(f"{weight:g}" for weight in config.opening_weights)
+            balance = (
+                f" | max score {config.opening_max_score} cp"
+                if config.opening_max_score > 0
+                else ""
+            )
+            print(
+                f"Guided openings: {config.opening_plies} plies | "
+                f"{config.opening_nodes} nodes | weights {weights}{balance}",
+                flush=True,
+            )
+        else:
+            print(
+                f"Uniform-random openings: {config.opening_plies} plies",
+                flush=True,
+            )
     print("Results, percentage, and Elo are from Engine 1's perspective.", flush=True)
     print("Press Ctrl+C to stop.", flush=True)
 
@@ -1270,6 +1478,16 @@ def serialize_pgn4_game(
     if marker is not None:
         moves.append(marker)
     first_player = fen_turn_index(str(fen) if fen else None)
+    move_tokens: list[str] = []
+    for index, move in enumerate(moves):
+        shifted = index + first_player
+        formatted = pgn4_move(move)
+        if shifted % 4 == 0 or index == 0:
+            move_tokens.append(f"{shifted // 4 + 1}.")
+        move_tokens.append(formatted)
+    if config.pgn4_single_line:
+        return " ".join(lines + move_tokens) + "\n"
+
     move_lines: list[str] = []
     for index, move in enumerate(moves):
         shifted = index + first_player
@@ -1319,6 +1537,44 @@ def append_pgn4(
 def sidecar(path: Path, suffix: str) -> Path:
     return path.with_name(path.name + suffix)
 
+def open_opening_engines(
+    config: MatchConfig,
+    stack: contextlib.ExitStack,
+) -> tuple[tuple[UciEngine, ...], UciEngine | None]:
+    if config.opening_nodes > 0:
+        multipv = len(config.opening_weights)
+        providers = (
+            stack.enter_context(UciEngine(
+                opening_search_config(config.engine1, multipv),
+                label="opening-search-engine1",
+            )),
+            stack.enter_context(UciEngine(
+                opening_search_config(config.engine2, multipv),
+                label="opening-search-engine2",
+            )),
+        )
+        rules = (
+            stack.enter_context(UciEngine(config.arbiter, label="opening-rules"))
+            if config.arbiter is not None
+            else None
+        )
+        return providers, rules
+
+    if config.arbiter is not None:
+        rules = stack.enter_context(UciEngine(config.arbiter, label="opening-rules"))
+        return (rules,), rules
+
+    return (
+        stack.enter_context(UciEngine(
+            config.engine1,
+            label="opening-rules-engine1",
+        )),
+        stack.enter_context(UciEngine(
+            config.engine2,
+            label="opening-rules-engine2",
+        )),
+    ), None
+
 def create_schedule(
     config: MatchConfig,
     entries: int,
@@ -1336,23 +1592,13 @@ def create_schedule(
         ]
     rng = random.Random(seed)
     if config.opening_plies:
-        if config.arbiter is not None:
-            with UciEngine(config.arbiter, label="opening-rules") as arbiter:
-                starts = [generate_start(config, rng, arbiter) for _ in range(entries)]
-        else:
-            starts = []
-            with UciEngine(
-                config.engine1,
-                label="opening-rules-engine1",
-            ) as engine1_rules, UciEngine(
-                config.engine2,
-                label="opening-rules-engine2",
-            ) as engine2_rules:
-                providers = (engine1_rules, engine2_rules)
-                first_provider = rng.randrange(2)
-                for entry_index in range(entries):
-                    opening_engine = providers[(first_provider + entry_index) % 2]
-                    starts.append(generate_start(config, rng, opening_engine))
+        starts = []
+        with contextlib.ExitStack() as stack:
+            providers, rules = open_opening_engines(config, stack)
+            first_provider = rng.randrange(len(providers))
+            for entry_index in range(entries):
+                opening_engine = providers[(first_provider + entry_index) % len(providers)]
+                starts.append(generate_start(config, rng, opening_engine, rules))
     else:
         starts = [generate_start(config, rng) for _ in range(entries)]
     if path is not None:
@@ -1385,6 +1631,7 @@ def iter_persistent_schedule(
     output = path.open("a", encoding="utf-8") if path is not None else None
     stack = contextlib.ExitStack()
     providers: tuple[UciEngine, ...] | None = None
+    rules: UciEngine | None = None
     existing_exhausted = existing is None
     try:
         for index in range(1, entries + 1):
@@ -1416,26 +1663,9 @@ def iter_persistent_schedule(
                 opening_engine = None
                 if config.opening_plies:
                     if providers is None:
-                        if config.arbiter is not None:
-                            providers = (
-                                stack.enter_context(UciEngine(
-                                    config.arbiter,
-                                    label="opening-rules",
-                                )),
-                            )
-                        else:
-                            providers = (
-                                stack.enter_context(UciEngine(
-                                    config.engine1,
-                                    label="opening-rules-engine1",
-                                )),
-                                stack.enter_context(UciEngine(
-                                    config.engine2,
-                                    label="opening-rules-engine2",
-                                )),
-                            )
+                        providers, rules = open_opening_engines(config, stack)
                     opening_engine = providers[(index - 1) % len(providers)]
-                start = generate_start(config, rng, opening_engine)
+                start = generate_start(config, rng, opening_engine, rules)
                 if output is not None:
                     output.write(json.dumps({
                         "index": index,
@@ -1506,6 +1736,7 @@ def execute_tasks(
     records_by_id: dict[str, dict[str, Any]] | None,
     *,
     continue_on_error: bool,
+    retries: int = 2,
     on_record: Any = None,
 ) -> bool:
     stop_event = threading.Event()
@@ -1515,21 +1746,42 @@ def execute_tasks(
         return play_game(config, task, stop_event, active_engines)
 
     executor = concurrent.futures.ThreadPoolExecutor(max_workers=config.workers)
-    futures: dict[concurrent.futures.Future[dict[str, Any]], GameTask] = {}
+    futures: dict[concurrent.futures.Future[dict[str, Any]], tuple[GameTask, int]] = {}
     task_iterator = iter(tasks)
+
+    def submit_task(task: GameTask, attempt: int) -> None:
+        futures[executor.submit(run_task, task)] = (task, attempt)
 
     def submit_next() -> bool:
         try:
             task = next(task_iterator)
         except StopIteration:
             return False
-        futures[executor.submit(run_task, task)] = task
+        submit_task(task, 0)
         return True
 
-    def save_record(task: GameTask, future: concurrent.futures.Future[dict[str, Any]]) -> None:
+    def is_retryable_error(exc: BaseException) -> bool:
+        return isinstance(exc, (EngineError, TimeoutError, OSError)) and not isinstance(
+            exc, EngineOptionError
+        )
+
+    def save_record(
+        task: GameTask,
+        attempt: int,
+        future: concurrent.futures.Future[dict[str, Any]],
+    ) -> bool:
         try:
             record = future.result()
         except Exception as exc:
+            if is_retryable_error(exc) and attempt < retries and not stop_event.is_set():
+                print(
+                    f"{task.game_id}: retrying after {type(exc).__name__}: {exc} "
+                    f"({attempt + 1}/{retries})",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                submit_task(task, attempt + 1)
+                return False
             if not continue_on_error:
                 raise
             record = {
@@ -1545,11 +1797,13 @@ def execute_tasks(
                 "engine1_score": 0.5,
                 "termination": "runner_error",
                 "error": f"{type(exc).__name__}: {exc}",
+                "attempts": attempt + 1,
             }
         if records_by_id is not None:
             records_by_id[task.game_id] = record
         if on_record is not None:
             on_record(record, records_by_id)
+        return True
 
     try:
         for _ in range(max(config.workers, config.workers * 2)):
@@ -1561,9 +1815,10 @@ def execute_tasks(
                 return_when=concurrent.futures.FIRST_COMPLETED,
             )
             for future in done:
-                task = futures.pop(future)
-                save_record(task, future)
-                submit_next()
+                task, attempt = futures.pop(future)
+                completed = save_record(task, attempt, future)
+                if completed:
+                    submit_next()
     except KeyboardInterrupt:
         stop_event.set()
         for future in futures:
@@ -1588,6 +1843,7 @@ def play_match(
     pairs: int,
     seed: int,
     continue_on_error: bool = False,
+    retries: int = 2,
     on_record: Any = None,
 ) -> MatchResult:
     """Run an in-memory paired match for callers such as tuning tools."""
@@ -1606,6 +1862,7 @@ def play_match(
         build_tasks(starts),
         records_by_id,
         continue_on_error=continue_on_error,
+        retries=retries,
         on_record=on_record,
     )
     records = list(records_by_id.values())
@@ -1649,6 +1906,11 @@ def run_match(args: argparse.Namespace) -> int:
     config = MatchConfig(engine1, engine2, arbiter, args.limit_kind, args.limit_value, args.tc,
                         args.inc, args.timeout, args.margin, args.max_plies, args.opening_plies,
                         load_fens(args.fens), args.workers, args.moves, out,
+                        opening_nodes=args.opening_nodes,
+                        opening_weights=args.opening_weights,
+                        opening_max_score=args.opening_max_score,
+                        opening_attempts=args.opening_attempts,
+                        pgn4_single_line=args.pgn4_single_line,
     )
     if arbiter is not None:
         validate_rules_commands(arbiter, "Arbiter", require_game_result=True)
@@ -1670,6 +1932,11 @@ def run_match(args: argparse.Namespace) -> int:
         "margin": args.margin,
         "max_plies": args.max_plies,
         "opening_plies": args.opening_plies,
+        "opening_nodes": args.opening_nodes,
+        "opening_weights": args.opening_weights,
+        "opening_max_score": args.opening_max_score,
+        "opening_attempts": args.opening_attempts,
+        "pgn4_single_line": args.pgn4_single_line,
         "fens": config.fens,
         "training_output": args.training_output,
     }
@@ -1799,6 +2066,7 @@ def run_match(args: argparse.Namespace) -> int:
         tasks,
         None,
         continue_on_error=args.continue_on_error,
+        retries=args.retries,
         on_record=on_record,
     )
     summary = stats.summary()
@@ -1861,7 +2129,38 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--margin", type=int, default=50, help="clock-loss margin in milliseconds")
     parser.add_argument("--timeout", type=float, default=30.0, help="engine response timeout")
     parser.add_argument("--max-plies", "--maxmoves", type=int, default=1000)
-    parser.add_argument("--opening-plies", type=int, default=0)
+    parser.add_argument(
+        "--opening-plies",
+        type=int,
+        default=0,
+        help="number of randomized opening plies shared by paired games",
+    )
+    parser.add_argument(
+        "--opening-nodes",
+        type=int,
+        default=0,
+        help="nodes per guided opening move; 0 keeps uniform legal-move randomization",
+    )
+    parser.add_argument(
+        "--opening-weights",
+        type=parse_opening_weights,
+        default=(60.0, 30.0, 10.0),
+        metavar="W1,W2,...",
+        help="relative probabilities for ranked MultiPV opening moves",
+    )
+    parser.add_argument(
+        "--opening-max-score",
+        type=int,
+        default=1000,
+        metavar="CP",
+        help="reject guided openings exceeding this absolute score; 0 disables",
+    )
+    parser.add_argument(
+        "--opening-attempts",
+        type=int,
+        default=100,
+        help="maximum attempts to generate a balanced guided opening",
+    )
     parser.add_argument("--fens", default="", help="opening FEN file")
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument(
@@ -1888,9 +2187,20 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="PATH",
         help="save Chess.com-style PGN4; default path: games.pgn4",
     )
+    parser.add_argument(
+        "--pgn4-single-line",
+        action="store_true",
+        help="write each PGN4 game on one line instead of standard multiline format",
+    )
     parser.add_argument("--moves", "--pmoves", action="store_true", help="show move search data")
     parser.add_argument("--quiet", action="store_true", help="only print the final result")
     parser.add_argument("--continue-on-error", "--continue", action="store_true")
+    parser.add_argument(
+        "--retries",
+        type=int,
+        default=2,
+        help="retry runner/engine failures before aborting or recording an error",
+    )
     parser.add_argument("--resume", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--fresh", action="store_true")
     return parser
@@ -1943,8 +2253,20 @@ def main() -> int:
         parser.error("--pairs must be at least 1")
     if args.workers < 1 or args.threads1 < 1 or args.threads2 < 1:
         parser.error("worker and engine thread counts must be at least 1")
+    if args.retries < 0:
+        parser.error("--retries must be at least 0")
     if args.summary_interval < 1:
         parser.error("--summary-interval must be at least 1")
+    if args.opening_plies < 0:
+        parser.error("--opening-plies must be at least 0")
+    if args.opening_nodes < 0:
+        parser.error("--opening-nodes must be at least 0")
+    if args.opening_nodes and not args.opening_plies:
+        parser.error("--opening-nodes requires --opening-plies")
+    if args.opening_max_score < 0:
+        parser.error("--opening-max-score must be at least 0")
+    if args.opening_attempts < 1:
+        parser.error("--opening-attempts must be at least 1")
     if args.training_output and not args.out:
         parser.error("--training-output requires --out")
     if args.limit_kind == "clock" and args.tc <= 0:
