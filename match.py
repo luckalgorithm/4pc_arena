@@ -718,6 +718,34 @@ def engine_signature(config: EngineConfig) -> dict[str, Any]:
         "threads": config.threads,
     }
 
+MATCH_METADATA_DEFAULTS: dict[str, Any] = {
+    "opening_nodes": 0,
+    "opening_weights": [60.0, 30.0, 10.0],
+    "opening_max_score": 1000,
+    "opening_attempts": 100,
+    "pgn4_single_line": False,
+}
+
+def normalized_match_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    """Fill fields absent from metadata written by older match versions."""
+    normalized = json.loads(json.dumps(payload))
+    for name, default in MATCH_METADATA_DEFAULTS.items():
+        normalized.setdefault(name, default)
+    return normalized
+
+def metadata_matches_payload(
+    metadata: dict[str, Any],
+    payload: dict[str, Any],
+    fingerprint: str,
+) -> bool:
+    if metadata.get("fingerprint") == fingerprint:
+        return True
+    saved = metadata.get("config")
+    return (
+        isinstance(saved, dict)
+        and normalized_match_payload(saved) == normalized_match_payload(payload)
+    )
+
 def opening_search_config(config: EngineConfig, multipv: int) -> EngineConfig:
     options = {
         name: value
@@ -1955,10 +1983,17 @@ def run_match(args: argparse.Namespace) -> int:
         raise ValueError(f"Output exists; use --resume or --fresh: {out}")
     if metadata_path is not None and metadata_path.is_file():
         metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-        if metadata.get("fingerprint") != fingerprint:
+        if not isinstance(metadata, dict) or not metadata_matches_payload(
+            metadata, payload, fingerprint
+        ):
             raise ValueError(
                 f"Existing match configuration differs: {metadata_path}. "
                 "Use the original settings, --fresh, or another --out."
+            )
+        if metadata.get("fingerprint") != fingerprint:
+            atomic_json(
+                metadata_path,
+                {"fingerprint": fingerprint, "config": payload},
             )
     elif metadata_path is not None:
         atomic_json(metadata_path, {"fingerprint": fingerprint, "config": payload})
