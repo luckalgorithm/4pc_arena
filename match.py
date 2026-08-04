@@ -17,6 +17,7 @@ import threading
 import time
 from dataclasses import dataclass
 from collections.abc import Iterable, Iterator
+from datetime import date
 from pathlib import Path
 from typing import Any
 
@@ -27,6 +28,19 @@ TEAM_BY_COLOR = {
     "blue": "bg",
     "green": "bg",
 }
+UCI_CLOCK_PREFIX = {
+    "red": "r",
+    "blue": "b",
+    "yellow": "y",
+    "green": "g",
+}
+FINAL_RESULTS = {"ry_win", "bg_win", "draw"}
+NNUE_GAME_TERMINATIONS = {
+    "game_result",
+    "engine_reported_result",
+    "no_legal_moves_result",
+}
+AUTO_NNUE_OUTPUT = "__auto_nnue_output__"
 
 class EngineError(RuntimeError):
     pass
@@ -79,12 +93,12 @@ class MatchConfig:
     fens: list[str]
     workers: int
     show_moves: bool
-    out: Path | None
     opening_nodes: int = 0
     opening_weights: tuple[float, ...] = (60.0, 30.0, 10.0)
     opening_max_score: int = 1000
     opening_attempts: int = 100
     pgn4_single_line: bool = False
+    nnue_output: bool = False
 
 @dataclass
 class SearchResult:
@@ -245,6 +259,67 @@ class ActiveEngines:
         for engine in engines:
             engine.close(force=True)
 
+class WorkerEngines:
+    """One reusable engine set owned by a single executor worker thread."""
+
+    def __init__(self, config: MatchConfig, active_engines: ActiveEngines) -> None:
+        self._stack = contextlib.ExitStack()
+        self._closed = False
+        try:
+            self.engine1 = self._stack.enter_context(UciEngine(
+                config.engine1,
+                label="worker:engine1",
+                active_engines=active_engines,
+            ))
+            self.engine2 = self._stack.enter_context(UciEngine(
+                config.engine2,
+                label="worker:engine2",
+                active_engines=active_engines,
+            ))
+            self.arbiter = (
+                self._stack.enter_context(UciEngine(
+                    config.arbiter,
+                    label="worker:arbiter",
+                    active_engines=active_engines,
+                ))
+                if config.arbiter is not None
+                else None
+            )
+        except BaseException:
+            self._stack.close()
+            raise
+
+    def close(self) -> None:
+        if not self._closed:
+            self._closed = True
+            self._stack.close()
+
+    def __enter__(self) -> WorkerEngines:
+        return self
+
+    def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
+        self.close()
+
+class WorkerEngineRegistry:
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._workers: set[WorkerEngines] = set()
+
+    def add(self, engines: WorkerEngines) -> None:
+        with self._lock:
+            self._workers.add(engines)
+
+    def discard(self, engines: WorkerEngines) -> None:
+        with self._lock:
+            self._workers.discard(engines)
+
+    def close_all(self) -> None:
+        with self._lock:
+            workers = list(self._workers)
+            self._workers.clear()
+        for engines in workers:
+            engines.close()
+
 class UciEngine:
     def __init__(
         self,
@@ -292,8 +367,18 @@ class UciEngine:
                 )
             self.send(f"setoption name Hash value {config.hash_mb}")
             self.send(f"setoption name Threads value {config.threads}")
-            for name, value in sorted(config.options.items()):
-                self.send(f"setoption name {name} value {option_text(value)}")
+            requested_by_casefold = {
+                name.casefold(): value for name, value in config.options.items()
+            }
+            # Preserve the engine's declaration order. Tuning builds may defer
+            # rebuilding derived tables until their final declared option.
+            for name in self.uci_options:
+                folded = name.casefold()
+                if folded in requested_by_casefold:
+                    self.send(
+                        f"setoption name {name} value "
+                        f"{option_text(requested_by_casefold[folded])}"
+                    )
             self.sync()
         except BaseException:
             self.close(force=True)
@@ -408,6 +493,16 @@ class UciEngine:
         self.send("gameresult")
         parts = self.wait_for("gameresult", timeout).split(maxsplit=1)
         return normalize_result(parts[1] if len(parts) == 2 else "unknown")
+
+    def current_fen(self, timeout: float = 30) -> str:
+        """Return the exact FEN for the engine's current root position."""
+        self.send("d")
+        line = self.wait_for("Fen:", timeout)
+        fen = line.removeprefix("Fen:").strip()
+        self.wait_for("Key:", timeout)
+        if not fen:
+            raise EngineError(f"{self.label} returned an empty FEN")
+        return fen
 
     def search(
         self,
@@ -701,6 +796,26 @@ def load_fens(path: str) -> list[str]:
         raise ValueError(f"No FENs found in {path}")
     return fens
 
+def shuffled_fens(
+    fens: list[str],
+    entries: int,
+    seed: int,
+) -> Iterator[str | None]:
+    """Yield shuffled FEN cycles without replacement within each cycle."""
+    if not fens:
+        for _ in range(entries):
+            yield None
+        return
+
+    rng = random.Random(f"{seed}:fens")
+    cycle = list(fens)
+    remaining = entries
+    while remaining > 0:
+        rng.shuffle(cycle)
+        cycle_size = min(remaining, len(cycle))
+        yield from cycle[:cycle_size]
+        remaining -= cycle_size
+
 def fen_turn_index(fen: str | None) -> int:
     if not fen:
         return 0
@@ -718,12 +833,24 @@ def engine_signature(config: EngineConfig) -> dict[str, Any]:
         "threads": config.threads,
     }
 
+def default_nnue_output_path(engine1: Path, engine2: Path) -> Path:
+    def safe_name(path: Path) -> str:
+        name = re.sub(r"[^A-Za-z0-9._-]+", "_", path.stem).strip("._-")
+        return name or "engine"
+
+    filename = (
+        f"{safe_name(engine1)}-vs-{safe_name(engine2)}-"
+        f"{date.today().isoformat()}.txt"
+    )
+    return Path(filename).resolve()
+
 MATCH_METADATA_DEFAULTS: dict[str, Any] = {
     "opening_nodes": 0,
     "opening_weights": [60.0, 30.0, 10.0],
     "opening_max_score": 1000,
     "opening_attempts": 100,
     "pgn4_single_line": False,
+    "nnue_output": False,
 }
 
 def normalized_match_payload(payload: dict[str, Any]) -> dict[str, Any]:
@@ -771,11 +898,11 @@ def opening_score_is_extreme(info: dict[str, Any], max_score: int) -> bool:
 def generate_start(
     config: MatchConfig,
     rng: random.Random,
+    fen: str | None,
     opening_engine: UciEngine | None = None,
     rules_engine: UciEngine | None = None,
 ) -> StartPosition:
     if config.opening_plies <= 0:
-        fen = rng.choice(config.fens) if config.fens else None
         moves: list[str] = []
         return StartPosition(fen, moves, "fen" if fen else "startpos")
     if opening_engine is None:
@@ -785,11 +912,10 @@ def generate_start(
                 config.engine1, len(config.opening_weights)
             )
         with UciEngine(opening_config, label="opening-rules") as owned:
-            return generate_start(config, rng, owned)
+            return generate_start(config, rng, fen, owned)
 
     attempts = config.opening_attempts if config.opening_nodes > 0 else 1
     for _ in range(attempts):
-        fen = rng.choice(config.fens) if config.fens else None
         moves = []
         rejected = False
         for _ply in range(config.opening_plies):
@@ -864,11 +990,23 @@ def generate_start(
 
 def go_command(config: MatchConfig, clocks: dict[str, int]) -> str:
     if config.limit_kind == "clock":
-        return (
-            f"go wtime {max(0, clocks['ry'])} btime {max(0, clocks['bg'])} "
-            f"winc {config.increment_ms} binc {config.increment_ms}"
+        times = " ".join(
+            f"{UCI_CLOCK_PREFIX[color]}time {max(0, clocks[color])}"
+            for color in TURN_ORDER
         )
+        increments = " ".join(
+            f"{UCI_CLOCK_PREFIX[color]}inc {config.increment_ms}"
+            for color in TURN_ORDER
+        )
+        return f"go {times} {increments}"
     return f"go {config.limit_kind} {config.limit_value}"
+
+def move_timeout(config: MatchConfig, clocks: dict[str, int], color: str) -> float:
+    """Return a search watchdog that does not undercut a legal clock think."""
+    if config.limit_kind != "clock":
+        return config.timeout
+    remaining = max(0, clocks[color]) + max(0, config.margin_ms)
+    return remaining / 1000 + config.timeout
 
 def winner_for_failure(team: str) -> str:
     return "bg_win" if team == "ry" else "ry_win"
@@ -880,19 +1018,7 @@ def engine1_score(result: str, engine1_team: str) -> float:
         return 1.0 if engine1_team == "ry" else 0.0
     if result == "bg_win":
         return 1.0 if engine1_team == "bg" else 0.0
-    return 0.5
-
-def current_engine_result(
-    engine: UciEngine,
-    moves: list[str],
-    fen: str | None,
-    timeout: float,
-) -> str:
-    try:
-        result = engine.game_result(moves, fen, timeout=min(timeout, 1.0))
-    except TimeoutError:
-        return "unknown"
-    return result if result in {"ry_win", "bg_win", "draw"} else "unknown"
+    raise ValueError(f"Invalid finished game result: {result}")
 
 def mate_score_result(info: dict[str, Any], team: str) -> str | None:
     score = info.get("score")
@@ -941,22 +1067,33 @@ def confirm_no_legal_moves(
         confirmation.info, team
     )
 
+@contextlib.contextmanager
+def game_engines(
+    config: MatchConfig,
+    active_engines: ActiveEngines,
+    reusable: WorkerEngines | None,
+) -> Iterator[WorkerEngines]:
+    if reusable is not None:
+        yield reusable
+        return
+    with WorkerEngines(config, active_engines) as owned:
+        yield owned
+
 def play_game(
     config: MatchConfig,
     task: GameTask,
     stop_event: threading.Event,
     active_engines: ActiveEngines,
+    reusable_engines: WorkerEngines | None = None,
 ) -> dict[str, Any]:
     if stop_event.is_set():
         raise MatchInterrupted("Match interrupted")
     engine1_is_ry = task.engine1_team == "ry"
-    ry_config = config.engine1 if engine1_is_ry else config.engine2
-    bg_config = config.engine2 if engine1_is_ry else config.engine1
     ry_number = 1 if engine1_is_ry else 2
     bg_number = 2 if engine1_is_ry else 1
     moves = list(task.start.opening_moves)
     searches: list[dict[str, Any]] = []
-    clocks = {"ry": config.base_time_ms, "bg": config.base_time_ms}
+    clocks = {color: config.base_time_ms for color in TURN_ORDER}
     start_turn = fen_turn_index(task.start.fen)
     record: dict[str, Any] = {
         "game_id": task.game_id,
@@ -974,22 +1111,16 @@ def play_game(
         "searches": searches,
     }
 
-    with contextlib.ExitStack() as stack:
-        ry_engine = stack.enter_context(UciEngine(
-            ry_config, label=f"{task.game_id}:RY", active_engines=active_engines
-        ))
-        bg_engine = stack.enter_context(UciEngine(
-            bg_config, label=f"{task.game_id}:BG", active_engines=active_engines
-        ))
-        arbiter = (
-            stack.enter_context(UciEngine(
-                config.arbiter,
-                label=f"{task.game_id}:arbiter",
-                active_engines=active_engines,
-            ))
-            if config.arbiter is not None
-            else None
-        )
+    with game_engines(config, active_engines, reusable_engines) as worker:
+        engine1 = worker.engine1
+        engine2 = worker.engine2
+        arbiter = worker.arbiter
+        ry_engine = engine1 if engine1_is_ry else engine2
+        bg_engine = engine2 if engine1_is_ry else engine1
+        ry_engine.label = f"{task.game_id}:RY"
+        bg_engine.label = f"{task.game_id}:BG"
+        if arbiter is not None:
+            arbiter.label = f"{task.game_id}:arbiter"
         record["engine_names"] = {
             "engine1": ry_engine.name if engine1_is_ry else bg_engine.name,
             "engine2": bg_engine.name if engine1_is_ry else ry_engine.name,
@@ -1007,9 +1138,13 @@ def play_game(
             engine = ry_engine if team == "ry" else bg_engine
             if arbiter is not None:
                 result = arbiter.game_result(moves, task.start.fen)
-                if result != "ongoing":
+                if result in FINAL_RESULTS:
                     return finish_game(
                         record, result, "game_result", moves, clocks, task.engine1_team
+                    )
+                if result != "ongoing":
+                    raise EngineError(
+                        f"{arbiter.label} returned an invalid game result: {result}"
                     )
             legal = (
                 arbiter.legal_moves(moves, task.start.fen)
@@ -1017,8 +1152,8 @@ def play_game(
                 else None
             )
             if legal == []:
-                return finish_game(
-                    record, "draw", "no_legal_moves", moves, clocks, task.engine1_team
+                raise EngineError(
+                    f"{arbiter.label} reports an ongoing game with no legal moves"
                 )
             engine_number = ry_number if team == "ry" else bg_number
             if legal is not None and len(legal) == 1:
@@ -1029,7 +1164,7 @@ def play_game(
                         moves,
                         task.start.fen,
                         go_command(config, clocks),
-                        config.timeout,
+                        move_timeout(config, clocks, color),
                     )
                 except TimeoutError:
                     result = winner_for_failure(team)
@@ -1067,20 +1202,28 @@ def play_game(
                     moves, clocks, task.engine1_team
                 )
             if config.limit_kind == "clock":
-                clocks[team] -= search.elapsed_ms
-                if clocks[team] < -config.margin_ms:
+                clocks[color] -= search.elapsed_ms
+                if clocks[color] < -config.margin_ms:
                     result = winner_for_failure(team)
                     return finish_game(
                         record, result, f"engine{engine_number}_time_loss",
                         moves, clocks, task.engine1_team
                     )
-                clocks[team] += config.increment_ms
+                clocks[color] += config.increment_ms
             if legal is not None and search.bestmove not in legal:
                 result = winner_for_failure(team)
                 return finish_game(
                     record, result, f"engine{engine_number}_illegal_move",
                     moves, clocks, task.engine1_team, illegal_move=search.bestmove
                 )
+            position_fen = None
+            score = search.info.get("score")
+            if (
+                config.nnue_output
+                and isinstance(score, dict)
+                and score.get("type") == "cp"
+            ):
+                position_fen = engine.current_fen(config.timeout)
             moves.append(search.bestmove)
             search_record = {
                 "ply": len(moves),
@@ -1089,9 +1232,11 @@ def play_game(
                 "engine": engine_number,
                 "move": search.bestmove,
                 "elapsed_ms": search.elapsed_ms,
-                "clock_ms": clocks[team] if config.limit_kind == "clock" else None,
+                "clock_ms": clocks[color] if config.limit_kind == "clock" else None,
                 **search.info,
             }
+            if position_fen is not None:
+                search_record["fen"] = position_fen
             searches.append(search_record)
             if config.show_moves:
                 print_move(task.game_id, search_record)
@@ -1122,57 +1267,10 @@ def summarize(
     *,
     paired: bool = True,
 ) -> dict[str, Any]:
-    wins1 = sum(float(r.get("engine1_score", 0.5)) == 1.0 for r in records)
-    wins2 = sum(float(r.get("engine1_score", 0.5)) == 0.0 for r in records)
-    draws = len(records) - wins1 - wins2
-    score = (wins1 + draws / 2) / len(records) if records else 0.5
-    if score >= 1.0:
-        elo = math.inf
-    elif score <= 0.0:
-        elo = -math.inf
-    else:
-        elo = 400 * math.log10(score / (1 - score))
-    pair_scores: list[float] = []
-    if paired:
-        by_id = {str(r["game_id"]): r for r in records}
-        for pair in range(1, games_expected // 2 + 1):
-            ry = by_id.get(f"pair{pair:04d}-ry")
-            bg = by_id.get(f"pair{pair:04d}-bg")
-            if ry and bg:
-                pair_scores.append(
-                    (float(ry["engine1_score"]) + float(bg["engine1_score"])) / 2
-                )
-    if len(pair_scores) > 1:
-        mean = sum(pair_scores) / len(pair_scores)
-        variance = sum((x - mean) ** 2 for x in pair_scores) / (len(pair_scores) - 1)
-        error = math.sqrt(variance / len(pair_scores))
-        confidence = [max(0.0, mean - 1.96 * error), min(1.0, mean + 1.96 * error)]
-    else:
-        confidence = None
-    terminations: dict[str, int] = {}
+    accumulator = SummaryAccumulator(games_expected, paired=paired)
     for record in records:
-        key = str(record.get("termination", "unknown"))
-        terminations[key] = terminations.get(key, 0) + 1
-    return {
-        "games_completed": len(records),
-        "games_expected": games_expected,
-        "engine1_wins": wins1,
-        "engine2_wins": wins2,
-        "draws": draws,
-        "engine1_score": score,
-        "engine2_score": 1 - score,
-        "elo": elo,
-        "pairs_completed": len(pair_scores),
-        "paired_95ci": confidence,
-        "engine1_illegal_moves": terminations.get("engine1_illegal_move", 0),
-        "engine2_illegal_moves": terminations.get("engine2_illegal_move", 0),
-        "engine1_time_losses": sum(v for k, v in terminations.items() if k == "engine1_time_loss"),
-        "engine2_time_losses": sum(v for k, v in terminations.items() if k == "engine2_time_loss"),
-        "engine1_timeouts": sum(v for k, v in terminations.items() if k == "engine1_timeout"),
-        "engine2_timeouts": sum(v for k, v in terminations.items() if k == "engine2_timeout"),
-        "runner_errors": terminations.get("runner_error", 0),
-        "terminations": terminations,
-    }
+        accumulator.add(record)
+    return accumulator.summary()
 
 def elo_text(elo: float) -> str:
     return (
@@ -1275,13 +1373,6 @@ def probe_engine_name(config: EngineConfig, label: str) -> str:
     with UciEngine(config, label=label) as engine:
         return engine.name
 
-def probe_engine_options(
-    config: EngineConfig,
-    label: str = "engine-options-probe",
-) -> tuple[str, dict[str, UciOption]]:
-    with UciEngine(config, label=label) as engine:
-        return engine.name, dict(engine.uci_options)
-
 def validate_rules_commands(
     config: EngineConfig,
     label: str,
@@ -1366,28 +1457,55 @@ def compact_training_record(record: dict[str, Any]) -> dict[str, Any]:
     compact["searches"] = [
         {
             key: search[key]
-            for key in ("ply", "team", "move", "depth", "nodes", "score")
+            for key in ("ply", "team", "move", "depth", "nodes", "score", "fen")
             if key in search
         }
         for search in record.get("searches", [])
     ]
     return compact
 
-def load_jsonl(path: Path) -> list[dict[str, Any]]:
-    if not path.is_file():
+def nnue_lines(record: dict[str, Any]) -> list[str]:
+    """Render position samples with score and result from side-to-move."""
+    if record.get("termination") not in NNUE_GAME_TERMINATIONS:
         return []
-    records: list[dict[str, Any]] = []
-    for number, raw in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
-        if not raw.strip():
+    game_result = str(record.get("result", ""))
+    lines: list[str] = []
+    for search in record.get("searches", []):
+        if not isinstance(search, dict):
+            continue
+        fen = search.get("fen")
+        team = search.get("team")
+        score = search.get("score")
+        if (
+            not isinstance(fen, str)
+            or not fen
+            or team not in {"ry", "bg"}
+            or not isinstance(score, dict)
+            or score.get("type") != "cp"
+        ):
             continue
         try:
-            record = json.loads(raw)
-        except json.JSONDecodeError as exc:
-            raise ValueError(f"Invalid JSON in {path} line {number}") from exc
-        if not isinstance(record, dict) or "game_id" not in record:
-            raise ValueError(f"Invalid game record in {path} line {number}")
-        records.append(record)
-    return records
+            centipawn = int(score["value"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if game_result == "draw":
+            result = "0.5"
+        elif game_result == f"{team}_win":
+            result = "1"
+        elif game_result in {"ry_win", "bg_win"}:
+            result = "0"
+        else:
+            continue
+        lines.append(f"| {fen} | {centipawn} | {result} |\n")
+    return lines
+
+def append_nnue(path: Path, record: dict[str, Any]) -> None:
+    lines = nnue_lines(record)
+    if not lines:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as output:
+        output.writelines(lines)
 
 def record_index(record: dict[str, Any]) -> int:
     raw = record.get("game", record.get("pair"))
@@ -1462,6 +1580,8 @@ def pgn4_terminal_marker(record: dict[str, Any]) -> str | None:
     if result in {"ry_win", "bg_win"}:
         if termination.endswith("_time_loss") or termination.endswith("_timeout"):
             return "T"
+        if termination.endswith("_illegal_move") or termination == "runner_error":
+            return None
         return "#"
     return None
 
@@ -1526,29 +1646,6 @@ def serialize_pgn4_game(
             move_lines[-1] += f" .. {formatted}"
     return "\n".join(lines + [""] + move_lines) + "\n\n"
 
-def write_pgn4(
-    path: Path,
-    records: list[dict[str, Any]],
-    config: MatchConfig,
-    engine1_name: str,
-    engine2_name: str,
-) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    ordered = sorted(
-        records,
-        key=lambda record: (
-            int(record.get("game", record.get("pair", 0)) or 0),
-            0 if record.get("engine1_team") == "ry" else 1,
-        ),
-    )
-    text = "".join(
-        serialize_pgn4_game(record, config, engine1_name, engine2_name)
-        for record in ordered
-    )
-    temp = path.with_suffix(path.suffix + ".tmp")
-    temp.write_text(text, encoding="utf-8")
-    temp.replace(path)
-
 def append_pgn4(
     path: Path,
     record: dict[str, Any],
@@ -1564,6 +1661,19 @@ def append_pgn4(
 
 def sidecar(path: Path, suffix: str) -> Path:
     return path.with_name(path.name + suffix)
+
+def validate_output_paths(paths: dict[str, Path | None]) -> None:
+    seen: dict[Path, str] = {}
+    for name, path in paths.items():
+        if path is None:
+            continue
+        resolved = path.resolve()
+        previous = seen.get(resolved)
+        if previous is not None:
+            raise ValueError(
+                f"Output paths overlap: {previous} and {name} both use {resolved}"
+            )
+        seen[resolved] = name
 
 def open_opening_engines(
     config: MatchConfig,
@@ -1619,16 +1729,20 @@ def create_schedule(
             for item in raw
         ]
     rng = random.Random(seed)
+    fens = shuffled_fens(config.fens, entries, seed)
     if config.opening_plies:
         starts = []
         with contextlib.ExitStack() as stack:
             providers, rules = open_opening_engines(config, stack)
             first_provider = rng.randrange(len(providers))
-            for entry_index in range(entries):
-                opening_engine = providers[(first_provider + entry_index) % len(providers)]
-                starts.append(generate_start(config, rng, opening_engine, rules))
+            for entry_index, fen in enumerate(fens):
+                provider_index = (first_provider + entry_index) % len(providers)
+                opening_engine = providers[provider_index]
+                starts.append(
+                    generate_start(config, rng, fen, opening_engine, rules)
+                )
     else:
-        starts = [generate_start(config, rng) for _ in range(entries)]
+        starts = [generate_start(config, rng, fen) for fen in fens]
     if path is not None:
         atomic_json(path, [
             {
@@ -1662,7 +1776,8 @@ def iter_persistent_schedule(
     rules: UciEngine | None = None
     existing_exhausted = existing is None
     try:
-        for index in range(1, entries + 1):
+        scheduled_fens = shuffled_fens(config.fens, entries, seed)
+        for index, fen in enumerate(scheduled_fens, 1):
             raw = (
                 existing.readline()
                 if existing is not None and not existing_exhausted
@@ -1693,7 +1808,7 @@ def iter_persistent_schedule(
                     if providers is None:
                         providers, rules = open_opening_engines(config, stack)
                     opening_engine = providers[(index - 1) % len(providers)]
-                start = generate_start(config, rng, opening_engine, rules)
+                start = generate_start(config, rng, fen, opening_engine, rules)
                 if output is not None:
                     output.write(json.dumps({
                         "index": index,
@@ -1769,9 +1884,36 @@ def execute_tasks(
 ) -> bool:
     stop_event = threading.Event()
     active_engines = ActiveEngines()
+    worker_registry = WorkerEngineRegistry()
+    worker_state = threading.local()
 
     def run_task(task: GameTask) -> dict[str, Any]:
-        return play_game(config, task, stop_event, active_engines)
+        engines = getattr(worker_state, "engines", None)
+        if engines is None:
+            engines = WorkerEngines(config, active_engines)
+            worker_registry.add(engines)
+            worker_state.engines = engines
+
+        def retire_engines() -> None:
+            worker_registry.discard(engines)
+            engines.close()
+            if getattr(worker_state, "engines", None) is engines:
+                del worker_state.engines
+
+        try:
+            record = play_game(
+                config,
+                task,
+                stop_event,
+                active_engines,
+                reusable_engines=engines,
+            )
+        except BaseException:
+            retire_engines()
+            raise
+        if str(record.get("termination", "")).endswith("_timeout"):
+            retire_engines()
+        return record
 
     executor = concurrent.futures.ThreadPoolExecutor(max_workers=config.workers)
     futures: dict[concurrent.futures.Future[dict[str, Any]], tuple[GameTask, int]] = {}
@@ -1853,6 +1995,7 @@ def execute_tasks(
             future.cancel()
         active_engines.close_all()
         executor.shutdown(wait=True, cancel_futures=True)
+        worker_registry.close_all()
         return True
     except BaseException:
         stop_event.set()
@@ -1860,9 +2003,11 @@ def execute_tasks(
             future.cancel()
         active_engines.close_all()
         executor.shutdown(wait=True, cancel_futures=True)
+        worker_registry.close_all()
         raise
     else:
         executor.shutdown(wait=True)
+        worker_registry.close_all()
         return False
 
 def play_match(
@@ -1931,14 +2076,22 @@ def run_match(args: argparse.Namespace) -> int:
 
     out = Path(args.out).resolve() if args.out else None
     pgn4 = Path(args.pgn4).resolve() if args.pgn4 else None
+    nnue_output = (
+        default_nnue_output_path(engine1.path, engine2.path)
+        if args.nnue_output == AUTO_NNUE_OUTPUT
+        else Path(args.nnue_output).resolve()
+        if args.nnue_output
+        else None
+    )
     config = MatchConfig(engine1, engine2, arbiter, args.limit_kind, args.limit_value, args.tc,
                         args.inc, args.timeout, args.margin, args.max_plies, args.opening_plies,
-                        load_fens(args.fens), args.workers, args.moves, out,
+                        load_fens(args.fens), args.workers, args.moves,
                         opening_nodes=args.opening_nodes,
                         opening_weights=args.opening_weights,
                         opening_max_score=args.opening_max_score,
                         opening_attempts=args.opening_attempts,
                         pgn4_single_line=args.pgn4_single_line,
+                        nnue_output=nnue_output is not None,
     )
     if arbiter is not None:
         validate_rules_commands(arbiter, "Arbiter", require_game_result=True)
@@ -1946,6 +2099,22 @@ def run_match(args: argparse.Namespace) -> int:
     metadata_path = sidecar(out, ".meta.json") if out is not None else None
     schedule_path = sidecar(out, ".schedule.jsonl") if out is not None else None
     summary_path = sidecar(out, ".summary.json") if out is not None else None
+    validate_output_paths({
+        "--out": out,
+        "metadata sidecar": metadata_path,
+        "schedule sidecar": schedule_path,
+        "summary sidecar": summary_path,
+        "--pgn4": pgn4,
+        "PGN4 temporary file": (
+            pgn4.with_suffix(pgn4.suffix + ".tmp") if pgn4 is not None else None
+        ),
+        "--nnue-output": nnue_output,
+        "NNUE temporary file": (
+            nnue_output.with_suffix(nnue_output.suffix + ".tmp")
+            if nnue_output is not None
+            else None
+        ),
+    })
     payload = {
         "format": 2,
         "engine1": engine_signature(engine1),
@@ -1967,6 +2136,7 @@ def run_match(args: argparse.Namespace) -> int:
         "pgn4_single_line": args.pgn4_single_line,
         "fens": config.fens,
         "training_output": args.training_output,
+        "nnue_output": nnue_output is not None,
     }
     if not args.paired:
         payload["mode"] = "unpaired"
@@ -1975,10 +2145,16 @@ def run_match(args: argparse.Namespace) -> int:
         json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
     ).hexdigest()
 
-    if args.fresh and out is not None:
-        for path in (out, metadata_path, schedule_path, summary_path, pgn4):
+    if args.fresh:
+        for path in (
+            out, metadata_path, schedule_path, summary_path, pgn4, nnue_output
+        ):
             if path is not None:
                 path.unlink(missing_ok=True)
+    if out is None and nnue_output is not None and nnue_output.exists():
+        raise ValueError(
+            f"NNUE output exists; use --fresh or another path: {nnue_output}"
+        )
     if out is not None and out.exists() and not args.resume:
         raise ValueError(f"Output exists; use --resume or --fresh: {out}")
     if metadata_path is not None and metadata_path.is_file():
@@ -2020,6 +2196,15 @@ def run_match(args: argparse.Namespace) -> int:
     if pgn_temp is not None:
         pgn_temp.parent.mkdir(parents=True, exist_ok=True)
         pgn_rebuild = pgn_temp.open("w", encoding="utf-8")
+    nnue_temp = (
+        nnue_output.with_suffix(nnue_output.suffix + ".tmp")
+        if nnue_output is not None
+        else None
+    )
+    nnue_rebuild = None
+    if nnue_temp is not None:
+        nnue_temp.parent.mkdir(parents=True, exist_ok=True)
+        nnue_rebuild = nnue_temp.open("w", encoding="utf-8")
     try:
         if resume_existing and out is not None:
             with out.open(encoding="utf-8") as rows:
@@ -2043,16 +2228,24 @@ def run_match(args: argparse.Namespace) -> int:
                                 record, config, name1, name2
                             )
                         )
+                    if nnue_rebuild is not None:
+                        nnue_rebuild.writelines(nnue_lines(record))
     finally:
         if pgn_rebuild is not None:
             pgn_rebuild.close()
+        if nnue_rebuild is not None:
+            nnue_rebuild.close()
     if pgn_temp is not None and pgn4 is not None:
         pgn_temp.replace(pgn4)
     elif pgn4 is not None:
         pgn4.parent.mkdir(parents=True, exist_ok=True)
         pgn4.write_text("", encoding="utf-8")
+    if nnue_temp is not None and nnue_output is not None:
+        nnue_temp.replace(nnue_output)
 
     print_start_banner(config, args.game_count, name1, name2)
+    if nnue_output is not None:
+        print(f"NNUE output: {nnue_output}", flush=True)
     if stats.games_completed:
         print(
             f"Resuming with {stats.games_completed} completed games.",
@@ -2082,6 +2275,8 @@ def run_match(args: argparse.Namespace) -> int:
         )
         if out is not None:
             append_jsonl(out, persisted)
+        if nnue_output is not None:
+            append_nnue(nnue_output, record)
         stats.add(record)
         summary = stats.summary()
         summary["engine1_name"] = name1
@@ -2162,7 +2357,15 @@ def build_parser() -> argparse.ArgumentParser:
     limit.add_argument("--tc", type=int, help="base time in milliseconds")
     parser.add_argument("--inc", type=int, default=0, help="increment in milliseconds")
     parser.add_argument("--margin", type=int, default=50, help="clock-loss margin in milliseconds")
-    parser.add_argument("--timeout", type=float, default=30.0, help="engine response timeout")
+    parser.add_argument(
+        "--timeout",
+        type=float,
+        default=30.0,
+        help=(
+            "engine response timeout in seconds; with --tc, this is grace time "
+            "after the active color's remaining clock"
+        ),
+    )
     parser.add_argument("--max-plies", "--maxmoves", type=int, default=1000)
     parser.add_argument(
         "--opening-plies",
@@ -2204,9 +2407,22 @@ def build_parser() -> argparse.ArgumentParser:
         help="optional JSONL output path; enables persistence and resume",
     )
     parser.add_argument(
+        "--compact-output",
         "--training-output",
+        dest="training_output",
         action="store_true",
-        help="write compact NNUE-ready JSONL records",
+        help="write compact JSONL records (--training-output is a legacy alias)",
+    )
+    parser.add_argument(
+        "--nnue-output",
+        nargs="?",
+        const=AUTO_NNUE_OUTPUT,
+        metavar="PATH",
+        default="",
+        help=(
+            "write side-to-move '| FEN | CENTIPAWN | RESULT |' samples; "
+            "without PATH, use ENGINE-vs-ENGINE-YYYY-MM-DD.txt"
+        ),
     )
     parser.add_argument(
         "--summary-interval",
@@ -2288,6 +2504,20 @@ def main() -> int:
         parser.error("--pairs must be at least 1")
     if args.workers < 1 or args.threads1 < 1 or args.threads2 < 1:
         parser.error("worker and engine thread counts must be at least 1")
+    if args.hash1 < 1 or args.hash2 < 1:
+        parser.error("engine hash sizes must be at least 1 MB")
+    if args.arbiter and args.arbiter_hash < 1:
+        parser.error("--arbiter-hash must be at least 1 MB")
+    if args.limit_kind != "clock" and args.limit_value <= 0:
+        parser.error(f"--{args.limit_kind} must be greater than 0")
+    if args.timeout <= 0:
+        parser.error("--timeout must be greater than 0")
+    if args.max_plies < 1:
+        parser.error("--max-plies must be at least 1")
+    if args.inc < 0:
+        parser.error("--inc must be at least 0")
+    if args.margin < 0:
+        parser.error("--margin must be at least 0")
     if args.retries < 0:
         parser.error("--retries must be at least 0")
     if args.summary_interval < 1:
@@ -2303,15 +2533,19 @@ def main() -> int:
     if args.opening_attempts < 1:
         parser.error("--opening-attempts must be at least 1")
     if args.training_output and not args.out:
-        parser.error("--training-output requires --out")
+        parser.error("--compact-output requires --out")
+    if args.pgn4_single_line and not args.pgn4:
+        parser.error("--pgn4-single-line requires --pgn4")
     if args.limit_kind == "clock" and args.tc <= 0:
         parser.error("--tc must be greater than 0")
     if args.limit_kind != "clock" and args.inc:
         parser.error("--inc requires --tc")
     if not args.arbiter and (args.arbiter_options or args.arbiter_option):
         parser.error("--arbiter-options and --arbiter-option require --arbiter")
-    if (args.fresh or not args.resume) and not args.out:
-        parser.error("--fresh and --no-resume require --out")
+    if args.fresh and not (args.out or args.pgn4 or args.nnue_output):
+        parser.error("--fresh requires an output option")
+    if not args.resume and not args.out:
+        parser.error("--no-resume requires --out")
     try:
         return run_match(args)
     except KeyboardInterrupt:

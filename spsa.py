@@ -546,7 +546,6 @@ def build_match_config(
         fens=load_fens(args.fens),
         workers=args.workers,
         show_moves=False,
-        out=None,
     )
 
 
