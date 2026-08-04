@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# Runs reproducible four-player team-chess matches between UCI engines. Match
+# scores are always reported from Engine 1's perspective; position samples use
+# the team whose color is to move.
 from __future__ import annotations
 
 import argparse
@@ -22,12 +25,14 @@ from pathlib import Path
 from typing import Any
 
 TURN_ORDER = ("red", "blue", "yellow", "green")
+# Red and Yellow share one engine, while Blue and Green share the other.
 TEAM_BY_COLOR = {
     "red": "ry",
     "yellow": "ry",
     "blue": "bg",
     "green": "bg",
 }
+# Four-player UCI assigns a distinct clock command prefix to every color.
 UCI_CLOCK_PREFIX = {
     "red": "r",
     "blue": "b",
@@ -35,6 +40,8 @@ UCI_CLOCK_PREFIX = {
     "green": "g",
 }
 FINAL_RESULTS = {"ry_win", "bg_win", "draw"}
+# Only rule-derived endings are reliable training labels. Infrastructure
+# failures and artificial move limits must not enter the NNUE corpus.
 NNUE_GAME_TERMINATIONS = {
     "game_result",
     "engine_reported_result",
@@ -42,16 +49,20 @@ NNUE_GAME_TERMINATIONS = {
 }
 AUTO_NNUE_OUTPUT = "__auto_nnue_output__"
 
+# Reports engine startup, protocol, and rule-command failures.
 class EngineError(RuntimeError):
     pass
 
 
+# Separates permanent option incompatibility from retryable engine failures.
 class EngineOptionError(EngineError):
-    """The engine does not support an option required by the match."""
+    pass
 
+# Signals coordinated shutdown without recording a game as an engine failure.
 class MatchInterrupted(RuntimeError):
     pass
 
+# Describes one engine process and the UCI options applied at startup.
 @dataclass(frozen=True)
 class EngineConfig:
     path: Path
@@ -59,12 +70,16 @@ class EngineConfig:
     hash_mb: int
     threads: int
 
+# Stores the exact root position and opening moves shared by a scheduled game
+# or by both games in a paired opening.
 @dataclass(frozen=True)
 class StartPosition:
     fen: str | None
     opening_moves: list[str]
     source: str
 
+# Identifies one scheduled game. Paired tasks use the same opening once with
+# Engine 1 on each team.
 @dataclass(frozen=True)
 class GameTask:
     pair_index: int
@@ -77,6 +92,8 @@ class GameTask:
         prefix = "pair" if self.paired else "game"
         return f"{prefix}{self.pair_index:04d}-{self.engine1_team}"
 
+# Collects the validated settings used by both the command-line runner and
+# programmatic callers such as the SPSA tuner.
 @dataclass
 class MatchConfig:
     engine1: EngineConfig
@@ -100,6 +117,8 @@ class MatchConfig:
     pgn4_single_line: bool = False
     nnue_output: bool = False
 
+# Captures the final response to one UCI search, including protocol-level game
+# completion or position-rejection details when no move is returned.
 @dataclass
 class SearchResult:
     bestmove: str | None
@@ -108,6 +127,8 @@ class SearchResult:
     result: str | None = None
     position_error: str | None = None
 
+# Retains the option metadata advertised during the UCI handshake. Dictionary
+# insertion order preserves the engine's declaration order when values are set.
 @dataclass(frozen=True)
 class UciOption:
     name: str
@@ -116,6 +137,8 @@ class UciOption:
     min: int | None
     max: int | None
 
+# Returns completed records and aggregate statistics to in-process match
+# clients without requiring JSONL output.
 @dataclass
 class MatchResult:
     records: list[dict[str, Any]]
@@ -124,6 +147,8 @@ class MatchResult:
     engine2_name: str
     interrupted: bool
 
+# Tracks completed schedule slots in constant space. A paired entry reserves
+# one slot for each Engine 1 team assignment.
 class CompletionTracker:
     def __init__(self, entries: int, *, paired: bool) -> None:
         self.entries = entries
@@ -149,6 +174,8 @@ class CompletionTracker:
         self._completed[slot] = 1
         return True
 
+# Accumulates WDL, termination counts, Elo, and paired confidence statistics
+# without retaining every game record. Pair variance uses Welford's algorithm.
 class SummaryAccumulator:
     def __init__(self, games_expected: int, *, paired: bool) -> None:
         self.games_expected = games_expected
@@ -163,6 +190,8 @@ class SummaryAccumulator:
         self.pair_mean = 0.0
         self.pair_m2 = 0.0
 
+    # Incorporates one Engine 1-oriented record. The first half of a pair waits
+    # in pending_pairs until its color-swapped partner arrives.
     def add(self, record: dict[str, Any]) -> None:
         score = float(record.get("engine1_score", 0.5))
         self.games_completed += 1
@@ -189,6 +218,8 @@ class SummaryAccumulator:
         self.pair_mean += delta / self.pairs_completed
         self.pair_m2 += delta * (pair_score - self.pair_mean)
 
+    # Returns a snapshot safe for JSON serialization. The confidence interval
+    # is computed over complete pair scores rather than individual games.
     def summary(self) -> dict[str, Any]:
         if self.games_completed:
             score = (
@@ -232,6 +263,8 @@ class SummaryAccumulator:
             "terminations": terminations,
         }
 
+# Registers every live subprocess so interruption can stop all workers before
+# the executor waits for their threads.
 class ActiveEngines:
     def __init__(self) -> None:
         self._lock = threading.Lock()
@@ -259,9 +292,9 @@ class ActiveEngines:
         for engine in engines:
             engine.close(force=True)
 
+# Owns one reusable engine pair and optional arbiter for a single executor
+# thread. Reuse avoids a UCI handshake and hash allocation before every game.
 class WorkerEngines:
-    """One reusable engine set owned by a single executor worker thread."""
-
     def __init__(self, config: MatchConfig, active_engines: ActiveEngines) -> None:
         self._stack = contextlib.ExitStack()
         self._closed = False
@@ -300,6 +333,8 @@ class WorkerEngines:
     def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
         self.close()
 
+# Provides synchronized shutdown for worker-owned engine sets. Individual
+# workers remove unhealthy sets before retrying with fresh processes.
 class WorkerEngineRegistry:
     def __init__(self) -> None:
         self._lock = threading.Lock()
@@ -320,6 +355,9 @@ class WorkerEngineRegistry:
         for engines in workers:
             engines.close()
 
+# Wraps one line-oriented UCI subprocess. A reader thread drains stdout into a
+# queue while the owning match thread performs synchronous request/response
+# operations; one instance is never shared by concurrent games.
 class UciEngine:
     def __init__(
         self,
@@ -390,6 +428,8 @@ class UciEngine:
     def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
         self.close()
 
+    # Continuously drains stdout so an engine cannot block on a full pipe. A
+    # None sentinel distinguishes process exit from an ordinary timeout.
     def _read_loop(self) -> None:
         assert self.proc.stdout is not None
         try:
@@ -397,16 +437,7 @@ class UciEngine:
                 line = raw.strip()
                 if not line:
                     continue
-                # Some 4PC builds print the final option line and uciok without
-                # an intervening newline. Split the sentinel so startup does not
-                # wait until the UCI handshake timeout expires.
-                if line != "uciok" and line.endswith("uciok"):
-                    option_line = line[: -len("uciok")].strip()
-                    if option_line:
-                        self._queue.put(option_line)
-                    self._queue.put("uciok")
-                else:
-                    self._queue.put(line)
+                self._queue.put(line)
         finally:
             self._queue.put(None)
 
@@ -447,6 +478,8 @@ class UciEngine:
             if line == "uciok":
                 return
 
+    # Consumes informational output until the requested response arrives.
+    # Explicit protocol rejection messages become actionable exceptions.
     def wait_for(self, prefix: str, timeout: float) -> str:
         deadline = time.monotonic() + timeout
         while True:
@@ -477,12 +510,16 @@ class UciEngine:
             command += " moves " + " ".join(moves)
         self.send(command)
 
+    # Uses the four-player engine extension that returns canonical legal moves
+    # for the supplied root and move sequence.
     def legal_moves(self, moves: list[str], fen: str | None) -> list[str]:
         self.set_position(moves, fen)
         self.send("legalmoves")
         parts = self.wait_for("legalmoves", 30).split(maxsplit=1)
         return [] if len(parts) == 1 else [canonical_move(move) for move in parts[1].split()]
 
+    # Uses the four-player engine extension that classifies the current game as
+    # ongoing, a team win, or a draw.
     def game_result(
         self,
         moves: list[str],
@@ -494,8 +531,9 @@ class UciEngine:
         parts = self.wait_for("gameresult", timeout).split(maxsplit=1)
         return normalize_result(parts[1] if len(parts) == 2 else "unknown")
 
+    # Reads the exact root FEN through the engine's diagnostic command. Waiting
+    # for Key ensures the complete diagnostic response is removed from stdout.
     def current_fen(self, timeout: float = 30) -> str:
-        """Return the exact FEN for the engine's current root position."""
         self.send("d")
         line = self.wait_for("Fen:", timeout)
         fen = line.removeprefix("Fen:").strip()
@@ -504,6 +542,8 @@ class UciEngine:
             raise EngineError(f"{self.label} returned an empty FEN")
         return fen
 
+    # Searches one position and retains the latest fields from its UCI info
+    # stream. A timeout requests stop before control returns to the match.
     def search(
         self,
         moves: list[str],
@@ -574,6 +614,8 @@ class UciEngine:
                 elapsed = int(round((time.monotonic() - started) * 1000))
                 return SearchResult(move, info, elapsed)
 
+    # Collects the final info record for each MultiPV rank. Results are returned
+    # in rank order and use the principal variation's first move.
     def search_multipv(
         self,
         moves: list[str],
@@ -625,6 +667,8 @@ class UciEngine:
             results.append(SearchResult(bestmove, {}, elapsed))
         return results
 
+    # Attempts a graceful UCI shutdown, then escalates to process termination.
+    # Cleanup is idempotent so interruption and normal scope exit may overlap.
     def close(self, *, force: bool = False) -> None:
         with self._close_lock:
             if self._closed and not force:
@@ -662,11 +706,14 @@ class UciEngine:
             ):
                 self._reader.join(timeout=0.5)
 
+# Converts typed configuration values to the spelling expected by UCI.
 def option_text(value: int | bool | str) -> str:
     if isinstance(value, bool):
         return "true" if value else "false"
     return str(value)
 
+# Parses the subset of a UCI option declaration needed for validation and for
+# preserving declaration order. Unknown declaration shapes are ignored.
 def parse_uci_option(line: str) -> UciOption | None:
     match = re.match(
         r"^option name (.*?) type (spin|check|combo|button|string)(?: (.*))?$",
@@ -690,9 +737,11 @@ def parse_uci_option(line: str) -> UciOption | None:
         max=int(max_match.group(1)) if max_match else None,
     )
 
+# Normalizes coordinate and PGN4-like separators before move comparison.
 def canonical_move(move: str) -> str:
     return move.strip().lower().replace("-", "").replace("=", "")
 
+# Maps common engine result spellings to the runner's team-oriented vocabulary.
 def normalize_result(result: str) -> str:
     key = result.strip().lower().replace("-", "").replace("_", "").replace(" ", "")
     if key in {"ongoing", "unfinished", "*"}:
@@ -705,6 +754,7 @@ def normalize_result(result: str) -> str:
         return "bg_win"
     return result.strip().lower()
 
+# Extracts the result embedded in Stockfish 4PC's completion information line.
 def completed_result(line: str) -> str:
     lowered = line.lower()
     if "ry won" in lowered:
@@ -715,6 +765,8 @@ def completed_result(line: str) -> str:
         return "draw"
     return "unknown"
 
+# Extracts stable numeric and principal-variation fields from one UCI info line.
+# Repeated dictionaries may be merged so later values replace earlier ones.
 def parse_info(line: str) -> dict[str, Any]:
     parts = line.split()
     info: dict[str, Any] = {}
@@ -745,6 +797,8 @@ def parse_info(line: str) -> dict[str, Any]:
             i += 1
     return info
 
+# Preserves integers and booleans from JSON while coercing command-line text to
+# those types when its spelling is unambiguous.
 def parse_option_value(value: Any) -> int | bool | str:
     if isinstance(value, (bool, int)):
         return value
@@ -757,6 +811,7 @@ def parse_option_value(value: Any) -> int | bool | str:
     except ValueError:
         return text
 
+# Parses positive MultiPV rank weights for argparse.
 def parse_opening_weights(value: str) -> tuple[float, ...]:
     try:
         weights = tuple(float(part.strip()) for part in value.split(","))
@@ -768,6 +823,8 @@ def parse_opening_weights(value: str) -> tuple[float, ...]:
         raise argparse.ArgumentTypeError("opening weights must all be positive")
     return weights
 
+# Loads a JSON option object, then applies repeated NAME=VALUE overrides in
+# command-line order.
 def load_options(path: str, overrides: list[str]) -> dict[str, int | bool | str]:
     values: dict[str, int | bool | str] = {}
     if path:
@@ -784,6 +841,7 @@ def load_options(path: str, overrides: list[str]) -> dict[str, int | bool | str]
         values[name] = parse_option_value(value)
     return values
 
+# Loads nonempty, non-comment opening positions in file order.
 def load_fens(path: str) -> list[str]:
     if not path:
         return []
@@ -796,12 +854,13 @@ def load_fens(path: str) -> list[str]:
         raise ValueError(f"No FENs found in {path}")
     return fens
 
+# Yields deterministic shuffled cycles. A FEN appears at most once per cycle,
+# avoiding the clumping caused by independent random choice.
 def shuffled_fens(
     fens: list[str],
     entries: int,
     seed: int,
 ) -> Iterator[str | None]:
-    """Yield shuffled FEN cycles without replacement within each cycle."""
     if not fens:
         for _ in range(entries):
             yield None
@@ -816,12 +875,16 @@ def shuffled_fens(
         yield from cycle[:cycle_size]
         remaining -= cycle_size
 
+# Returns the starting color index encoded by a four-player FEN. Startpos and
+# malformed turn fields conservatively fall back to Red.
 def fen_turn_index(fen: str | None) -> int:
     if not fen:
         return 0
     token = fen.split("-", 1)[0].strip().lower()
     return {"r": 0, "b": 1, "y": 2, "g": 3}.get(token[:1], 0)
 
+# Captures enough executable and option identity to reject incompatible resume
+# attempts without hashing a potentially large binary on every invocation.
 def engine_signature(config: EngineConfig) -> dict[str, Any]:
     stat = config.path.stat()
     return {
@@ -833,6 +896,7 @@ def engine_signature(config: EngineConfig) -> dict[str, Any]:
         "threads": config.threads,
     }
 
+# Builds the stable same-day NNUE filename used by a bare --nnue-output flag.
 def default_nnue_output_path(engine1: Path, engine2: Path) -> Path:
     def safe_name(path: Path) -> str:
         name = re.sub(r"[^A-Za-z0-9._-]+", "_", path.stem).strip("._-")
@@ -853,13 +917,16 @@ MATCH_METADATA_DEFAULTS: dict[str, Any] = {
     "nnue_output": False,
 }
 
+# Adds defaults for fields absent from metadata written by older runner
+# versions, allowing compatible runs to resume across schema additions.
 def normalized_match_payload(payload: dict[str, Any]) -> dict[str, Any]:
-    """Fill fields absent from metadata written by older match versions."""
     normalized = json.loads(json.dumps(payload))
     for name, default in MATCH_METADATA_DEFAULTS.items():
         normalized.setdefault(name, default)
     return normalized
 
+# Accepts either the current fingerprint or an older payload whose normalized
+# settings are equivalent to the requested match.
 def metadata_matches_payload(
     metadata: dict[str, Any],
     payload: dict[str, Any],
@@ -873,6 +940,8 @@ def metadata_matches_payload(
         and normalized_match_payload(saved) == normalized_match_payload(payload)
     )
 
+# Clones an engine configuration with the requested MultiPV width while leaving
+# the caller's option dictionary unchanged.
 def opening_search_config(config: EngineConfig, multipv: int) -> EngineConfig:
     options = {
         name: value
@@ -882,6 +951,8 @@ def opening_search_config(config: EngineConfig, multipv: int) -> EngineConfig:
     options["MultiPV"] = multipv
     return EngineConfig(config.path, options, config.hash_mb, config.threads)
 
+# Rejects mate scores and centipawn evaluations outside the configured opening
+# balance window. A zero threshold disables centipawn rejection only.
 def opening_score_is_extreme(info: dict[str, Any], max_score: int) -> bool:
     if max_score <= 0:
         return False
@@ -895,6 +966,9 @@ def opening_score_is_extreme(info: dict[str, Any], max_score: int) -> bool:
     except (KeyError, TypeError, ValueError):
         return False
 
+# Generates one shared start position. Uniform mode samples legal moves; guided
+# mode samples weighted MultiPV ranks and retries openings whose final score is
+# too extreme.
 def generate_start(
     config: MatchConfig,
     rng: random.Random,
@@ -988,6 +1062,8 @@ def generate_start(
         "or increase --opening-attempts"
     )
 
+# Builds either a fixed-limit search or a four-color clock search. Every color
+# retains its own time even though teammates share an engine process.
 def go_command(config: MatchConfig, clocks: dict[str, int]) -> str:
     if config.limit_kind == "clock":
         times = " ".join(
@@ -1001,16 +1077,20 @@ def go_command(config: MatchConfig, clocks: dict[str, int]) -> str:
         return f"go {times} {increments}"
     return f"go {config.limit_kind} {config.limit_value}"
 
+# Gives clock searches the active color's remaining time plus the configured
+# response grace. Fixed-limit searches use the response timeout directly.
 def move_timeout(config: MatchConfig, clocks: dict[str, int], color: str) -> float:
-    """Return a search watchdog that does not undercut a legal clock think."""
     if config.limit_kind != "clock":
         return config.timeout
     remaining = max(0, clocks[color]) + max(0, config.margin_ms)
     return remaining / 1000 + config.timeout
 
+# Returns the opposing team result after a time, protocol, or move failure.
 def winner_for_failure(team: str) -> str:
     return "bg_win" if team == "ry" else "ry_win"
 
+# Converts a team result to a score from Engine 1's assignment in this game.
+# Unknown terminal values are rejected rather than silently counted as draws.
 def engine1_score(result: str, engine1_team: str) -> float:
     if result == "draw":
         return 0.5
@@ -1020,6 +1100,7 @@ def engine1_score(result: str, engine1_team: str) -> float:
         return 1.0 if engine1_team == "bg" else 0.0
     raise ValueError(f"Invalid finished game result: {result}")
 
+# Interprets a mate score from the searching team's side-to-move perspective.
 def mate_score_result(info: dict[str, Any], team: str) -> str | None:
     score = info.get("score")
     if not isinstance(score, dict) or score.get("type") != "mate":
@@ -1030,6 +1111,8 @@ def mate_score_result(info: dict[str, Any], team: str) -> str | None:
         return None
     return winner_for_failure(team) if value <= 0 else f"{team}_win"
 
+# Finalizes the mutable game record in one place so every termination includes
+# the same moves, score, and four-color clock snapshot.
 def finish_game(
     record: dict[str, Any],
     result: str,
@@ -1049,6 +1132,8 @@ def finish_game(
     )
     return record
 
+# Asks the other engine for a shallow confirmation when the moving engine
+# returns no move. Explicit result messages take precedence over mate scores.
 def confirm_no_legal_moves(
     engine: UciEngine,
     moves: list[str],
@@ -1067,6 +1152,8 @@ def confirm_no_legal_moves(
         confirmation.info, team
     )
 
+# Borrows a worker's persistent engines when available, or creates a scoped set
+# for direct callers of play_game().
 @contextlib.contextmanager
 def game_engines(
     config: MatchConfig,
@@ -1079,6 +1166,10 @@ def game_engines(
     with WorkerEngines(config, active_engines) as owned:
         yield owned
 
+# Plays one complete scheduled game. Engine processes are assigned to teams for
+# this task, synchronized with ucinewgame, and driven one color at a time. The
+# returned record contains enough search data for summaries, PGN4, and optional
+# NNUE export.
 def play_game(
     config: MatchConfig,
     task: GameTask,
@@ -1136,6 +1227,8 @@ def play_game(
             color = TURN_ORDER[(start_turn + len(moves)) % 4]
             team = TEAM_BY_COLOR[color]
             engine = ry_engine if team == "ry" else bg_engine
+            # A dedicated arbiter is authoritative for both terminal state and
+            # legality. Contradictory responses indicate a protocol failure.
             if arbiter is not None:
                 result = arbiter.game_result(moves, task.start.fen)
                 if result in FINAL_RESULTS:
@@ -1178,6 +1271,9 @@ def play_game(
                         f"{engine.label} rejected the starting position: "
                         f"{search.position_error}"
                     )
+                # The next engine discovers a rejected move only after receiving
+                # the updated position, so responsibility belongs to the
+                # previous team.
                 previous_team = "bg" if team == "ry" else "ry"
                 previous_number = bg_number if previous_team == "bg" else ry_number
                 result = winner_for_failure(previous_team)
@@ -1201,6 +1297,7 @@ def play_game(
                     "no_legal_moves_result" if result else "no_legal_moves",
                     moves, clocks, task.engine1_team
                 )
+            # Clock time belongs to the moving color, not to its two-color team.
             if config.limit_kind == "clock":
                 clocks[color] -= search.elapsed_ms
                 if clocks[color] < -config.margin_ms:
@@ -1216,6 +1313,8 @@ def play_game(
                     record, result, f"engine{engine_number}_illegal_move",
                     moves, clocks, task.engine1_team, illegal_move=search.bestmove
                 )
+            # The root FEN must be captured before bestmove is appended; its
+            # side-to-move team defines both CP and result perspective.
             position_fen = None
             score = search.info.get("score")
             if (
@@ -1244,6 +1343,7 @@ def play_game(
         record, "draw", "max_plies", moves, clocks, task.engine1_team
     )
 
+# Formats either a centipawn or mate score for the live move display.
 def score_text(info: dict[str, Any]) -> str:
     score = info.get("score")
     if not isinstance(score, dict):
@@ -1252,6 +1352,7 @@ def score_text(info: dict[str, Any]) -> str:
         return f"M{score.get('value')}"
     return f"{int(score.get('value', 0)):+d}"
 
+# Prints one compact, flush-safe search line for interactive monitoring.
 def print_move(game_id: str, info: dict[str, Any]) -> None:
     print(
         f"{game_id} ply {info['ply']:03d} {info['color']:<6} "
@@ -1261,6 +1362,8 @@ def print_move(game_id: str, info: dict[str, Any]) -> None:
         flush=True,
     )
 
+# Replays records through the streaming accumulator so batch and live summaries
+# use exactly the same statistics implementation.
 def summarize(
     records: list[dict[str, Any]],
     games_expected: int,
@@ -1272,6 +1375,7 @@ def summarize(
         accumulator.add(record)
     return accumulator.summary()
 
+# Renders finite and saturated Elo values with an explicit sign.
 def elo_text(elo: float) -> str:
     return (
         "+inf" if elo == math.inf
@@ -1279,6 +1383,7 @@ def elo_text(elo: float) -> str:
         else f"{elo:+.1f}"
     )
 
+# Describes exceptional terminations appended to a live summary line.
 def live_event(record: dict[str, Any], name1: str, name2: str) -> str:
     termination = str(record.get("termination", ""))
     names = {"engine1": name1, "engine2": name2}
@@ -1294,6 +1399,7 @@ def live_event(record: dict[str, Any], name1: str, name2: str) -> str:
         return f" [Runner error: {record.get('error', 'unknown error')}]"
     return ""
 
+# Prints cumulative WDL, score, and Elo after one completed game.
 def print_summary(
     summary: dict[str, Any],
     name1: str,
@@ -1311,6 +1417,8 @@ def print_summary(
         flush=True,
     )
 
+# Prints the final Engine 1-oriented result and any exceptional termination
+# counts that merit attention.
 def print_final_summary(
     summary: dict[str, Any],
     name1: str,
@@ -1357,6 +1465,8 @@ def print_final_summary(
     if summary["runner_errors"]:
         print(f"Runner errors: {summary['runner_errors']}")
 
+# Recovers advertised engine names from the newest record, falling back to
+# executable filenames before any game has completed.
 def engine_names(
     records: list[dict[str, Any]], engine1: EngineConfig, engine2: EngineConfig
 ) -> tuple[str, str]:
@@ -1369,10 +1479,13 @@ def engine_names(
             )
     return engine1.path.name, engine2.path.name
 
+# Performs a short UCI handshake solely to obtain the advertised engine name.
 def probe_engine_name(config: EngineConfig, label: str) -> str:
     with UciEngine(config, label=label) as engine:
         return engine.name
 
+# Verifies the nonstandard legalmoves and optional gameresult commands before a
+# long run starts, producing an immediate configuration error when unsupported.
 def validate_rules_commands(
     config: EngineConfig,
     label: str,
@@ -1389,6 +1502,7 @@ def validate_rules_commands(
                     f"{label} returned an invalid gameresult response: {result}"
                 )
 
+# Produces the human-readable search limit used in the start banner.
 def control_text(config: MatchConfig) -> str:
     if config.limit_kind == "clock":
         return f"tc {config.base_time_ms}ms + {config.increment_ms}ms"
@@ -1396,6 +1510,8 @@ def control_text(config: MatchConfig) -> str:
         return f"movetime {config.limit_value}ms"
     return f"{config.limit_kind} {config.limit_value}"
 
+# Summarizes the match, opening policy, and scoring perspective before workers
+# begin producing interleaved output.
 def print_start_banner(
     config: MatchConfig,
     games: int,
@@ -1429,11 +1545,15 @@ def print_start_banner(
     print("Results, percentage, and Elo are from Engine 1's perspective.", flush=True)
     print("Press Ctrl+C to stop.", flush=True)
 
+# Appends one self-contained game record and closes the file immediately so
+# completed games survive interruption.
 def append_jsonl(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as f:
         f.write(json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n")
 
+# Removes display and diagnostic fields while retaining everything needed to
+# resume a match or derive position-level training samples.
 def compact_training_record(record: dict[str, Any]) -> dict[str, Any]:
     compact = {
         key: record[key]
@@ -1464,8 +1584,9 @@ def compact_training_record(record: dict[str, Any]) -> dict[str, Any]:
     ]
     return compact
 
+# Renders position samples from the side-to-move team's perspective. Technical
+# and artificial endings are excluded because they are unreliable game labels.
 def nnue_lines(record: dict[str, Any]) -> list[str]:
-    """Render position samples with score and result from side-to-move."""
     if record.get("termination") not in NNUE_GAME_TERMINATIONS:
         return []
     game_result = str(record.get("result", ""))
@@ -1499,6 +1620,7 @@ def nnue_lines(record: dict[str, Any]) -> list[str]:
         lines.append(f"| {fen} | {centipawn} | {result} |\n")
     return lines
 
+# Appends every eligible position from one completed game.
 def append_nnue(path: Path, record: dict[str, Any]) -> None:
     lines = nnue_lines(record)
     if not lines:
@@ -1507,6 +1629,7 @@ def append_nnue(path: Path, record: dict[str, Any]) -> None:
     with path.open("a", encoding="utf-8") as output:
         output.writelines(lines)
 
+# Recovers a schedule index from current fields or a legacy game identifier.
 def record_index(record: dict[str, Any]) -> int:
     raw = record.get("game", record.get("pair"))
     if raw is not None:
@@ -1516,15 +1639,19 @@ def record_index(record: dict[str, Any]) -> int:
         raise ValueError(f"Cannot determine game index: {record.get('game_id')}")
     return int(match.group(1))
 
+# Replaces a JSON document through a sibling temporary file so readers never
+# observe a partially written schedule, summary, or metadata file.
 def atomic_json(path: Path, payload: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temp = path.with_suffix(path.suffix + ".tmp")
     temp.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     temp.replace(path)
 
+# Escapes a quoted PGN4 tag value.
 def pgn4_escape(value: str) -> str:
     return value.replace("\\", "\\\\").replace('"', '\\"')
 
+# Converts normalized coordinate moves to Chess.com-style PGN4 coordinates.
 def pgn4_move(move: str) -> str:
     if len(move) == 1 or "-" in move:
         return move
@@ -1541,6 +1668,7 @@ def pgn4_move(move: str) -> str:
     suffix = f"={promotion.upper()}" if promotion else ""
     return f"{source}-{target}{suffix}"
 
+# Encodes clock and fixed-movetime limits in the PGN4 TimeControl tag.
 def pgn4_time_control(config: MatchConfig) -> str:
     if config.limit_kind == "clock":
         return f"{config.base_time_ms // 60000}+{config.increment_ms // 1000}"
@@ -1548,6 +1676,7 @@ def pgn4_time_control(config: MatchConfig) -> str:
         return f"0+{config.limit_value // 1000}"
     return "0+0"
 
+# Maps team results to the two-team PGN result field.
 def pgn4_result(result: str) -> str:
     return {
         "ry_win": "1-0",
@@ -1555,6 +1684,7 @@ def pgn4_result(result: str) -> str:
         "draw": "1/2-1/2",
     }.get(result, "*")
 
+# Produces an explanatory Termination tag only for exceptional endings.
 def pgn4_termination(record: dict[str, Any]) -> str | None:
     termination = str(record.get("termination", ""))
     labels = {
@@ -1572,6 +1702,8 @@ def pgn4_termination(record: dict[str, Any]) -> str | None:
         return "Engine timeout"
     return None
 
+# Selects the Chess.com move-list marker for draws, time losses, and ordinary
+# decisive endings. Technical errors are not mislabeled as checkmate.
 def pgn4_terminal_marker(record: dict[str, Any]) -> str | None:
     result = str(record.get("result", ""))
     termination = str(record.get("termination", ""))
@@ -1585,6 +1717,7 @@ def pgn4_terminal_marker(record: dict[str, Any]) -> str | None:
         return "#"
     return None
 
+# Returns Red/Yellow and Blue/Green names after applying this game's team swap.
 def pgn4_engine_names(
     record: dict[str, Any],
     engine1_name: str,
@@ -1598,6 +1731,7 @@ def pgn4_engine_names(
         return engine1_name, engine2_name
     return engine2_name, engine1_name
 
+# Serializes one game as standard multiline PGN4 or as a single transport line.
 def serialize_pgn4_game(
     record: dict[str, Any],
     config: MatchConfig,
@@ -1646,6 +1780,7 @@ def serialize_pgn4_game(
             move_lines[-1] += f" .. {formatted}"
     return "\n".join(lines + [""] + move_lines) + "\n\n"
 
+# Appends one completed game while keeping the output usable during long runs.
 def append_pgn4(
     path: Path,
     record: dict[str, Any],
@@ -1659,9 +1794,12 @@ def append_pgn4(
             serialize_pgn4_game(record, config, engine1_name, engine2_name)
         )
 
+# Adds a descriptive suffix without replacing the primary file's extension.
 def sidecar(path: Path, suffix: str) -> Path:
     return path.with_name(path.name + suffix)
 
+# Rejects aliases among user outputs, sidecars, and rebuild temporaries before
+# any of them are created or truncated.
 def validate_output_paths(paths: dict[str, Path | None]) -> None:
     seen: dict[Path, str] = {}
     for name, path in paths.items():
@@ -1675,6 +1813,8 @@ def validate_output_paths(paths: dict[str, Path | None]) -> None:
             )
         seen[resolved] = name
 
+# Opens the smallest engine set needed for opening generation. Guided openings
+# alternate search providers; a dedicated arbiter supplies rules when present.
 def open_opening_engines(
     config: MatchConfig,
     stack: contextlib.ExitStack,
@@ -1713,6 +1853,8 @@ def open_opening_engines(
         )),
     ), None
 
+# Materializes the in-memory schedule used by programmatic callers. A persisted
+# schedule is reused only when it contains exactly the requested entry count.
 def create_schedule(
     config: MatchConfig,
     entries: int,
@@ -1755,6 +1897,8 @@ def create_schedule(
         ])
     return starts
 
+# Streams a deterministic schedule to avoid retaining every opening in memory.
+# Existing entries are validated and replayed before new entries are appended.
 def iter_persistent_schedule(
     config: MatchConfig,
     entries: int,
@@ -1833,6 +1977,8 @@ def iter_persistent_schedule(
         if existing is not None:
             existing.close()
 
+# Expands each scheduled opening into one unpaired task or two color-swapped
+# paired tasks, skipping slots already present in resumed output.
 def iter_tasks(
     starts: Iterable[tuple[int, StartPosition]],
     completed: CompletionTracker,
@@ -1848,12 +1994,14 @@ def iter_tasks(
             if not completed.contains(index, team):
                 yield GameTask(index, team, start, paired)
 
+# Checks executable availability before spawning worker threads.
 def validate_engine(config: EngineConfig, label: str) -> None:
     if not config.path.is_file():
         raise ValueError(f"{label} does not exist: {config.path}")
     if not os.access(config.path, os.X_OK):
         raise ValueError(f"{label} is not executable: {config.path}")
 
+# Builds the list form of iter_tasks() for in-process matches and older callers.
 def build_tasks(
     starts: list[StartPosition],
     records_by_id: dict[str, dict[str, Any]] | None = None,
@@ -1873,6 +2021,9 @@ def build_tasks(
                 tasks.append(task)
     return tasks
 
+# Runs tasks concurrently with bounded lookahead, retries transient engine
+# failures, and emits each finished record exactly once. Each executor thread
+# retains its engine set until shutdown or an unhealthy result retires it.
 def execute_tasks(
     config: MatchConfig,
     tasks: Iterable[GameTask],
@@ -1894,6 +2045,8 @@ def execute_tasks(
             worker_registry.add(engines)
             worker_state.engines = engines
 
+        # A failed protocol exchange may leave unread output in the queue. Such
+        # a set is closed rather than reused by the next game.
         def retire_engines() -> None:
             worker_registry.discard(engines)
             engines.close()
@@ -1975,6 +2128,8 @@ def execute_tasks(
             on_record(record, records_by_id)
         return True
 
+    # Keep at most two tasks queued per worker. This supplies work promptly
+    # without materializing or submitting a very large schedule at once.
     try:
         for _ in range(max(config.workers, config.workers * 2)):
             if not submit_next():
@@ -2010,6 +2165,9 @@ def execute_tasks(
         worker_registry.close_all()
         return False
 
+# Runs an in-memory paired match for callers such as tuning tools. It validates
+# executables, builds deterministic openings, and returns all records plus the
+# Engine 1-oriented aggregate result.
 def play_match(
     config: MatchConfig,
     *,
@@ -2019,7 +2177,6 @@ def play_match(
     retries: int = 2,
     on_record: Any = None,
 ) -> MatchResult:
-    """Run an in-memory paired match for callers such as tuning tools."""
     for engine, label in (
         (config.engine1, "Engine 1"),
         (config.engine2, "Engine 2"),
@@ -2045,6 +2202,9 @@ def play_match(
     summary["engine2_name"] = name2
     return MatchResult(records, summary, name1, name2, interrupted)
 
+# Orchestrates the persistent command-line workflow: validates engines and
+# outputs, verifies resume metadata, rebuilds derived files, streams unfinished
+# tasks, and checkpoints each completed record.
 def run_match(args: argparse.Namespace) -> int:
     engine1 = EngineConfig(
         Path(args.engine1).resolve(),
@@ -2145,6 +2305,8 @@ def run_match(args: argparse.Namespace) -> int:
         json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
     ).hexdigest()
 
+    # Resume is allowed only when the saved configuration describes the same
+    # engines, schedule, limits, and output schema.
     if args.fresh:
         for path in (
             out, metadata_path, schedule_path, summary_path, pgn4, nnue_output
@@ -2187,6 +2349,8 @@ def run_match(args: argparse.Namespace) -> int:
         and args.resume
         and not args.fresh
     )
+    # PGN4 and NNUE are derived from game JSONL. Rebuilding them through
+    # temporaries prevents duplicate samples when a run resumes.
     pgn_temp = (
         pgn4.with_suffix(pgn4.suffix + ".tmp")
         if pgn4 is not None and resume_existing
@@ -2260,6 +2424,8 @@ def run_match(args: argparse.Namespace) -> int:
     )
     tasks = iter_tasks(starts, completed, paired=args.paired)
 
+    # The completion tracker is the single gate for persistence and statistics,
+    # so retries or duplicate resume records cannot be emitted twice.
     def on_record(
         record: dict[str, Any],
         _current_by_id: dict[str, dict[str, Any]] | None,
@@ -2319,6 +2485,7 @@ def run_match(args: argparse.Namespace) -> int:
     return 0
 
 
+# Defines the complete public command-line surface without performing I/O.
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Run matches between two 4PC UCI engines"
@@ -2456,6 +2623,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--fresh", action="store_true")
     return parser
 
+# Normalizes paired/unpaired counts and search limits, validates cross-option
+# constraints, then translates runner failures into stable process exit codes.
 def main() -> int:
     parser = build_parser()
     args = parser.parse_args()
