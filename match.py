@@ -3043,10 +3043,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--compact-output",
-        "--training-output",
         dest="training_output",
         action="store_true",
-        help="write compact JSONL records (--training-output is a legacy alias)",
+        help="write compact JSONL records",
     )
     parser.add_argument(
         "--nnue-output",
