@@ -40,6 +40,9 @@ UCI_CLOCK_PREFIX = {
     "green": "g",
 }
 FINAL_RESULTS = {"ry_win", "bg_win", "draw"}
+NORMALIZED_ELO_SCALE = 800 / math.log(10)
+NORMAL_95_Z = 1.959963984540054
+SPRT_REPORT_SEPARATOR = "----------------------------------------------"
 # Only rule-derived endings are reliable training labels. Infrastructure
 # failures and artificial move limits must not enter the NNUE corpus.
 NNUE_GAME_TERMINATIONS = {
@@ -69,6 +72,14 @@ class EngineConfig:
     options: dict[str, int | bool | str]
     hash_mb: int
     threads: int
+
+# Configures the normalized-Elo hypotheses and error bounds for a paired SPRT.
+@dataclass(frozen=True)
+class SprtConfig:
+    elo0: float
+    elo1: float
+    alpha: float = 0.05
+    beta: float = 0.05
 
 # Stores the exact root position and opening moves shared by a scheduled game
 # or by both games in a paired opening.
@@ -116,6 +127,7 @@ class MatchConfig:
     opening_attempts: int = 100
     pgn4_single_line: bool = False
     nnue_output: bool = False
+    sprt: SprtConfig | None = None
 
 # Captures the final response to one UCI search, including protocol-level game
 # completion or position-rejection details when no move is returned.
@@ -174,12 +186,223 @@ class CompletionTracker:
         self._completed[slot] = 1
         return True
 
+
+# Normalized-Elo GSPRT calculations. The constrained multinomial
+# estimate uses deterministic bisection for its secular equation.
+def regularized_results(results: list[int]) -> list[float]:
+    return [float(value) if value else 1e-3 for value in results]
+
+
+def distribution_stats(pdf: list[tuple[float, float]]) -> tuple[float, float]:
+    total = sum(probability for _, probability in pdf)
+    if not math.isclose(total, 1.0, rel_tol=0.0, abs_tol=1e-6):
+        raise ValueError("Probability distribution does not sum to one")
+    mean = sum(value * probability for value, probability in pdf)
+    variance = sum(
+        probability * (value - mean) ** 2 for value, probability in pdf
+    )
+    if variance <= 0 or not math.isfinite(variance):
+        raise ValueError("Probability distribution has no finite variance")
+    return mean, variance
+
+
+def solve_secular(pdf: list[tuple[float, float]]) -> float:
+    values = [value for value, _ in pdf]
+    low_value = min(values)
+    high_value = max(values)
+    if low_value * high_value >= 0:
+        raise ValueError("Secular equation support must straddle zero")
+    epsilon = 1e-9
+    low = -1 / high_value + epsilon
+    high = -1 / low_value - epsilon
+
+    def objective(x: float) -> float:
+        return sum(
+            probability * value / (1 + x * value)
+            for value, probability in pdf
+        )
+
+    low_result = objective(low)
+    high_result = objective(high)
+    if low_result < 0 or high_result > 0:
+        raise ValueError("Could not bracket secular equation root")
+    for _ in range(200):
+        midpoint = (low + high) / 2
+        result = objective(midpoint)
+        if abs(result) <= 1e-13:
+            return midpoint
+        if result > 0:
+            low = midpoint
+        else:
+            high = midpoint
+        if high - low <= 1e-13 * max(1.0, abs(midpoint)):
+            return (low + high) / 2
+    raise ValueError("Secular equation did not converge")
+
+
+def mle_t_value(
+    empirical: list[tuple[float, float]],
+    reference: float,
+    target: float,
+) -> list[tuple[float, float]]:
+    count = len(empirical)
+    estimate = [(value, 1 / count) for value, _ in empirical]
+    for _ in range(10):
+        previous = estimate
+        mean, variance = distribution_stats(estimate)
+        deviation = math.sqrt(variance)
+        adjusted = [
+            (
+                value
+                - reference
+                - target
+                * deviation
+                * (1 + ((mean - value) / deviation) ** 2)
+                / 2,
+                probability,
+            )
+            for value, probability in empirical
+        ]
+        root = solve_secular(adjusted)
+        estimate = [
+            (
+                empirical[index][0],
+                empirical[index][1] / (1 + root * adjusted[index][0]),
+            )
+            for index in range(count)
+        ]
+        if max(
+            abs(previous[index][1] - estimate[index][1])
+            for index in range(count)
+        ) < 1e-9:
+            break
+    mean, variance = distribution_stats(estimate)
+    actual = (mean - reference) / math.sqrt(variance)
+    if not math.isclose(actual, target, rel_tol=0.0, abs_tol=1e-5):
+        raise ValueError("Constrained likelihood estimate did not converge")
+    return estimate
+
+
+def normalized_llr(elo0: float, elo1: float, results: list[int]) -> float:
+    regularized = regularized_results(results)
+    sample_count = sum(regularized)
+    pdf = [
+        (index / 4, value / sample_count)
+        for index, value in enumerate(regularized)
+    ]
+    scale = math.sqrt(2) / NORMALIZED_ELO_SCALE
+    hypotheses = (elo0 * scale, elo1 * scale)
+    estimates = [mle_t_value(pdf, 0.5, target) for target in hypotheses]
+    jumps = [
+        (
+            math.log(estimates[1][index][1])
+            - math.log(estimates[0][index][1]),
+            pdf[index][1],
+        )
+        for index in range(5)
+    ]
+    mean, _ = distribution_stats(jumps)
+    return sample_count * mean
+
+
+def logistic_elo(score: float) -> float:
+    bounded = min(max(score, 1e-3), 1 - 1e-3)
+    return -400 * math.log10(1 / bounded - 1)
+
+
+def pentanomial_estimates(
+    results: list[int],
+) -> tuple[float, float, float, float]:
+    regularized = regularized_results(results)
+    pair_count = sum(regularized)
+    games = 2 * pair_count
+    score = sum(value * (index / 2) for index, value in enumerate(regularized)) / games
+    pair_mean = 2 * score
+    variance = sum(
+        value * (index / 2 - pair_mean) ** 2
+        for index, value in enumerate(regularized)
+    ) / games
+    deviation = math.sqrt(variance)
+    error = NORMAL_95_Z * deviation / math.sqrt(games)
+    elo = logistic_elo(score)
+    elo_95 = (logistic_elo(score + error) - logistic_elo(score - error)) / 2
+    normalized_elo = (score - 0.5) / deviation * NORMALIZED_ELO_SCALE
+    normalized_elo_95 = NORMAL_95_Z / math.sqrt(games) * NORMALIZED_ELO_SCALE
+    return elo, elo_95, normalized_elo, normalized_elo_95
+
+
+class PentanomialSprt:
+    def __init__(self, config: SprtConfig) -> None:
+        self.config = config
+        self.results = [0, 0, 0, 0, 0]
+        self.lower_bound = math.log(config.beta / (1 - config.alpha))
+        self.upper_bound = math.log((1 - config.beta) / config.alpha)
+        self.llr = 0.0
+        self.state = "running"
+
+    def add_pair(self, first: float, second: float) -> None:
+        if first not in {0.0, 0.5, 1.0} or second not in {0.0, 0.5, 1.0}:
+            raise ValueError("SPRT game scores must be 0, 0.5, or 1")
+        bucket = int(round(2 * (first + second)))
+        self.results[bucket] += 1
+        self.llr = normalized_llr(
+            self.config.elo0,
+            self.config.elo1,
+            self.results,
+        )
+        if self.llr < self.lower_bound:
+            self.state = "rejected"
+        elif self.llr > self.upper_bound:
+            self.state = "accepted"
+        else:
+            self.state = "running"
+
+    @property
+    def pairs_completed(self) -> int:
+        return sum(self.results)
+
+    @property
+    def terminal(self) -> bool:
+        return self.state in {"accepted", "rejected"}
+
+    def snapshot(self, *, final: bool = False) -> dict[str, Any]:
+        state = "inconclusive" if final and self.state == "running" else self.state
+        estimates = (
+            pentanomial_estimates(self.results)
+            if self.pairs_completed
+            else (None, None, None, None)
+        )
+        return {
+            "model": "normalized",
+            "elo0": self.config.elo0,
+            "elo1": self.config.elo1,
+            "alpha": self.config.alpha,
+            "beta": self.config.beta,
+            "llr": self.llr,
+            "lower_bound": self.lower_bound,
+            "upper_bound": self.upper_bound,
+            "state": state,
+            "pentanomial": list(self.results),
+            "pairs_completed": self.pairs_completed,
+            "elo": estimates[0],
+            "elo_95": estimates[1],
+            "normalized_elo": estimates[2],
+            "normalized_elo_95": estimates[3],
+        }
+
 # Accumulates WDL, termination counts, Elo, and paired confidence statistics
 # without retaining every game record. Pair variance uses Welford's algorithm.
 class SummaryAccumulator:
-    def __init__(self, games_expected: int, *, paired: bool) -> None:
+    def __init__(
+        self,
+        games_expected: int,
+        *,
+        paired: bool,
+        sprt: SprtConfig | None = None,
+    ) -> None:
         self.games_expected = games_expected
         self.paired = paired
+        self.sprt = PentanomialSprt(sprt) if sprt is not None else None
         self.games_completed = 0
         self.engine1_wins = 0
         self.engine2_wins = 0
@@ -217,10 +440,12 @@ class SummaryAccumulator:
         delta = pair_score - self.pair_mean
         self.pair_mean += delta / self.pairs_completed
         self.pair_m2 += delta * (pair_score - self.pair_mean)
+        if self.sprt is not None:
+            self.sprt.add_pair(previous, score)
 
     # Returns a snapshot safe for JSON serialization. The confidence interval
     # is computed over complete pair scores rather than individual games.
-    def summary(self) -> dict[str, Any]:
+    def summary(self, *, final: bool = False) -> dict[str, Any]:
         if self.games_completed:
             score = (
                 self.engine1_wins + self.draws / 2
@@ -242,7 +467,7 @@ class SummaryAccumulator:
                 min(1.0, self.pair_mean + 1.96 * error),
             ]
         terminations = dict(self.terminations)
-        return {
+        result = {
             "games_completed": self.games_completed,
             "games_expected": self.games_expected,
             "engine1_wins": self.engine1_wins,
@@ -262,6 +487,15 @@ class SummaryAccumulator:
             "runner_errors": terminations.get("runner_error", 0),
             "terminations": terminations,
         }
+        if self.sprt is not None:
+            sprt = self.sprt.snapshot(final=final)
+            result["sprt"] = sprt
+            if sprt["elo"] is not None:
+                result["elo"] = sprt["elo"]
+                result["elo_95"] = sprt["elo_95"]
+                result["normalized_elo"] = sprt["normalized_elo"]
+                result["normalized_elo_95"] = sprt["normalized_elo_95"]
+        return result
 
 # Registers every live subprocess so interruption can stop all workers before
 # the executor waits for their threads.
@@ -1369,11 +1603,13 @@ def summarize(
     games_expected: int,
     *,
     paired: bool = True,
+    sprt: SprtConfig | None = None,
+    final: bool = False,
 ) -> dict[str, Any]:
-    accumulator = SummaryAccumulator(games_expected, paired=paired)
+    accumulator = SummaryAccumulator(games_expected, paired=paired, sprt=sprt)
     for record in records:
         accumulator.add(record)
-    return accumulator.summary()
+    return accumulator.summary(final=final)
 
 # Renders finite and saturated Elo values with an explicit sign.
 def elo_text(elo: float) -> str:
@@ -1416,6 +1652,82 @@ def print_summary(
         f"{event}",
         flush=True,
     )
+
+
+def sprt_control_text(config: MatchConfig) -> str:
+    if config.limit_kind == "clock":
+        base_seconds = config.base_time_ms / 1000
+        base = f"{base_seconds:.3f}".rstrip("0").rstrip(".")
+        control = f"{base}+{config.increment_ms / 1000:.2f}"
+    elif config.limit_kind == "nodes":
+        control = f"Nodes={config.limit_value}"
+    elif config.limit_kind == "depth":
+        control = f"Depth={config.limit_value}"
+    else:
+        control = f"Move={config.limit_value}ms"
+    return (
+        f"{control} Th={config.engine1.threads} "
+        f"Hash={config.engine1.hash_mb}MB Conc={config.workers}"
+    )
+
+
+def sprt_info(summary: dict[str, Any]) -> str | None:
+    parts: list[str] = []
+    paired_counts = (
+        ("Timeouts", "engine1_timeouts", "engine2_timeouts"),
+        ("Time losses", "engine1_time_losses", "engine2_time_losses"),
+        ("Illegal moves", "engine1_illegal_moves", "engine2_illegal_moves"),
+    )
+    for label, first_key, second_key in paired_counts:
+        first = int(summary[first_key])
+        second = int(summary[second_key])
+        if first or second:
+            parts.append(f"[{label}: {first} / {second}]")
+    terminations = summary["terminations"]
+    scalar_counts = (
+        ("No legal moves", "no_legal_moves"),
+        ("Max plies", "max_plies"),
+        ("Runner errors", "runner_error"),
+    )
+    for label, key in scalar_counts:
+        count = int(terminations.get(key, 0))
+        if count:
+            parts.append(f"[{label}: {count}]")
+    return " ".join(parts) if parts else None
+
+
+def format_sprt_report(summary: dict[str, Any], config: MatchConfig) -> str:
+    sprt = summary["sprt"]
+    if not sprt["pairs_completed"]:
+        raise ValueError("Cannot format an SPRT report without a complete pair")
+    lines = [
+        f"Elo   | {sprt['elo']:.2f} +- {sprt['elo_95']:.2f} (95%)",
+        (
+            f"nElo  | {sprt['normalized_elo']:.2f} +- "
+            f"{sprt['normalized_elo_95']:.2f} (95%)"
+        ),
+        f"SPRT  | {sprt_control_text(config)}",
+        (
+            f"LLR   | {sprt['llr']:.2f} "
+            f"({sprt['lower_bound']:.2f}, {sprt['upper_bound']:.2f}) "
+            f"[{sprt['elo0']:.2f}, {sprt['elo1']:.2f} normalized]"
+        ),
+        (
+            f"Games | N: {summary['games_completed']} "
+            f"W: {summary['engine1_wins']} L: {summary['engine2_wins']} "
+            f"D: {summary['draws']}"
+        ),
+        "Penta | " + " ".join(str(value) for value in sprt["pentanomial"]),
+    ]
+    info = sprt_info(summary)
+    if info is not None:
+        lines.append(f"Info  | {info}")
+    lines.append(SPRT_REPORT_SEPARATOR)
+    return "\n".join(lines)
+
+
+def print_sprt_report(summary: dict[str, Any], config: MatchConfig) -> None:
+    print(format_sprt_report(summary, config), flush=True)
 
 # Prints the final Engine 1-oriented result and any exceptional termination
 # counts that merit attention.
@@ -2001,6 +2313,30 @@ def validate_engine(config: EngineConfig, label: str) -> None:
     if not os.access(config.path, os.X_OK):
         raise ValueError(f"{label} is not executable: {config.path}")
 
+
+def validate_sprt_config(
+    config: MatchConfig,
+    *,
+    continue_on_error: bool,
+) -> None:
+    sprt = config.sprt
+    if sprt is None:
+        return
+    if not math.isfinite(sprt.elo0) or not math.isfinite(sprt.elo1):
+        raise ValueError("SPRT Elo bounds must be finite")
+    if sprt.elo0 >= sprt.elo1:
+        raise ValueError("SPRT ELO0 must be less than ELO1")
+    if not 0 < sprt.alpha < 1 or not 0 < sprt.beta < 1:
+        raise ValueError("SPRT alpha and beta must be between 0 and 1")
+    if sprt.alpha + sprt.beta >= 1:
+        raise ValueError("SPRT alpha plus beta must be less than 1")
+    if config.engine1.threads != config.engine2.threads:
+        raise ValueError("SPRT requires equal engine thread counts")
+    if config.engine1.hash_mb != config.engine2.hash_mb:
+        raise ValueError("SPRT requires equal engine hash sizes")
+    if continue_on_error:
+        raise ValueError("SPRT cannot use continue-on-error")
+
 # Builds the list form of iter_tasks() for in-process matches and older callers.
 def build_tasks(
     starts: list[StartPosition],
@@ -2032,6 +2368,8 @@ def execute_tasks(
     continue_on_error: bool,
     retries: int = 2,
     on_record: Any = None,
+    ordered: bool = False,
+    should_stop: Any = None,
 ) -> bool:
     stop_event = threading.Event()
     active_engines = ActiveEngines()
@@ -2069,18 +2407,28 @@ def execute_tasks(
         return record
 
     executor = concurrent.futures.ThreadPoolExecutor(max_workers=config.workers)
-    futures: dict[concurrent.futures.Future[dict[str, Any]], tuple[GameTask, int]] = {}
+    futures: dict[
+        concurrent.futures.Future[dict[str, Any]], tuple[GameTask, int, int]
+    ] = {}
+    ready: dict[
+        int,
+        tuple[GameTask, int, concurrent.futures.Future[dict[str, Any]]],
+    ] = {}
     task_iterator = iter(tasks)
+    next_order = 0
+    next_commit = 0
 
-    def submit_task(task: GameTask, attempt: int) -> None:
-        futures[executor.submit(run_task, task)] = (task, attempt)
+    def submit_task(task: GameTask, attempt: int, order: int) -> None:
+        futures[executor.submit(run_task, task)] = (task, attempt, order)
 
     def submit_next() -> bool:
+        nonlocal next_order
         try:
             task = next(task_iterator)
         except StopIteration:
             return False
-        submit_task(task, 0)
+        submit_task(task, 0, next_order)
+        next_order += 1
         return True
 
     def is_retryable_error(exc: BaseException) -> bool:
@@ -2091,6 +2439,7 @@ def execute_tasks(
     def save_record(
         task: GameTask,
         attempt: int,
+        order: int,
         future: concurrent.futures.Future[dict[str, Any]],
     ) -> bool:
         try:
@@ -2103,7 +2452,7 @@ def execute_tasks(
                     file=sys.stderr,
                     flush=True,
                 )
-                submit_task(task, attempt + 1)
+                submit_task(task, attempt + 1, order)
                 return False
             if not continue_on_error:
                 raise
@@ -2134,16 +2483,40 @@ def execute_tasks(
         for _ in range(max(config.workers, config.workers * 2)):
             if not submit_next():
                 break
-        while futures:
+        statistical_stop = False
+        while futures and not statistical_stop:
             done, _ = concurrent.futures.wait(
                 futures,
                 return_when=concurrent.futures.FIRST_COMPLETED,
             )
-            for future in done:
-                task, attempt = futures.pop(future)
-                completed = save_record(task, attempt, future)
-                if completed:
+            if ordered:
+                for future in done:
+                    task, attempt, order = futures.pop(future)
+                    ready[order] = (task, attempt, future)
+                while next_commit in ready:
+                    task, attempt, future = ready.pop(next_commit)
+                    completed = save_record(task, attempt, next_commit, future)
+                    if not completed:
+                        break
+                    next_commit += 1
+                    if should_stop is not None and should_stop():
+                        statistical_stop = True
+                        break
                     submit_next()
+            else:
+                for future in done:
+                    task, attempt, order = futures.pop(future)
+                    completed = save_record(task, attempt, order, future)
+                    if completed:
+                        submit_next()
+        if statistical_stop:
+            stop_event.set()
+            for future in futures:
+                future.cancel()
+            active_engines.close_all()
+            executor.shutdown(wait=True, cancel_futures=True)
+            worker_registry.close_all()
+            return False
     except KeyboardInterrupt:
         stop_event.set()
         for future in futures:
@@ -2177,6 +2550,9 @@ def play_match(
     retries: int = 2,
     on_record: Any = None,
 ) -> MatchResult:
+    if pairs < 1:
+        raise ValueError("pairs must be at least 1")
+    validate_sprt_config(config, continue_on_error=continue_on_error)
     for engine, label in (
         (config.engine1, "Engine 1"),
         (config.engine2, "Engine 2"),
@@ -2187,17 +2563,33 @@ def play_match(
 
     starts = create_schedule(config, pairs, seed, None, False)
     records_by_id: dict[str, dict[str, Any]] = {}
+    stats = SummaryAccumulator(pairs * 2, paired=True, sprt=config.sprt)
+
+    def collect_record(
+        record: dict[str, Any],
+        current_by_id: dict[str, dict[str, Any]] | None,
+    ) -> None:
+        stats.add(record)
+        if on_record is not None:
+            on_record(record, current_by_id)
+
     interrupted = execute_tasks(
         config,
         build_tasks(starts),
         records_by_id,
         continue_on_error=continue_on_error,
         retries=retries,
-        on_record=on_record,
+        on_record=collect_record,
+        ordered=config.sprt is not None,
+        should_stop=(
+            (lambda: stats.sprt is not None and stats.sprt.terminal)
+            if config.sprt is not None
+            else None
+        ),
     )
     records = list(records_by_id.values())
     name1, name2 = engine_names(records, config.engine1, config.engine2)
-    summary = summarize(records, pairs * 2, paired=True)
+    summary = stats.summary(final=not interrupted)
     summary["engine1_name"] = name1
     summary["engine2_name"] = name2
     return MatchResult(records, summary, name1, name2, interrupted)
@@ -2252,7 +2644,9 @@ def run_match(args: argparse.Namespace) -> int:
                         opening_attempts=args.opening_attempts,
                         pgn4_single_line=args.pgn4_single_line,
                         nnue_output=nnue_output is not None,
+                        sprt=args.sprt_config,
     )
+    validate_sprt_config(config, continue_on_error=args.continue_on_error)
     if arbiter is not None:
         validate_rules_commands(arbiter, "Arbiter", require_game_result=True)
 
@@ -2301,6 +2695,14 @@ def run_match(args: argparse.Namespace) -> int:
     if not args.paired:
         payload["mode"] = "unpaired"
         payload["games"] = args.game_count
+    if config.sprt is not None:
+        payload["sprt"] = {
+            "model": "normalized",
+            "elo0": config.sprt.elo0,
+            "elo1": config.sprt.elo1,
+            "alpha": config.sprt.alpha,
+            "beta": config.sprt.beta,
+        }
     fingerprint = hashlib.sha256(
         json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
     ).hexdigest()
@@ -2339,7 +2741,11 @@ def run_match(args: argparse.Namespace) -> int:
     name1 = probe_engine_name(engine1, "engine1-probe")
     name2 = probe_engine_name(engine2, "engine2-probe")
     completed = CompletionTracker(args.schedule_count, paired=args.paired)
-    stats = SummaryAccumulator(args.game_count, paired=args.paired)
+    stats = SummaryAccumulator(
+        args.game_count,
+        paired=args.paired,
+        sprt=config.sprt,
+    )
     resume_existing = (
         out is not None and out.is_file() and args.resume and not args.fresh
     )
@@ -2423,6 +2829,7 @@ def run_match(args: argparse.Namespace) -> int:
         resume=resume_schedule,
     )
     tasks = iter_tasks(starts, completed, paired=args.paired)
+    last_sprt_report: tuple[int, int, str] | None = None
 
     # The completion tracker is the single gate for persistence and statistics,
     # so retries or duplicate resume records cannot be emitted twice.
@@ -2430,6 +2837,7 @@ def run_match(args: argparse.Namespace) -> int:
         record: dict[str, Any],
         _current_by_id: dict[str, dict[str, Any]] | None,
     ) -> None:
+        nonlocal last_sprt_report
         index = record_index(record)
         team = str(record.get("engine1_team", ""))
         if not completed.add(index, team):
@@ -2443,8 +2851,11 @@ def run_match(args: argparse.Namespace) -> int:
             append_jsonl(out, persisted)
         if nnue_output is not None:
             append_nnue(nnue_output, record)
+        pairs_before = stats.pairs_completed
         stats.add(record)
-        summary = stats.summary()
+        completed_pair = stats.pairs_completed > pairs_before
+        reached_cap = stats.games_completed >= stats.games_expected
+        summary = stats.summary(final=reached_cap)
         summary["engine1_name"] = name1
         summary["engine2_name"] = name2
         if (
@@ -2454,24 +2865,51 @@ def run_match(args: argparse.Namespace) -> int:
             atomic_json(summary_path, summary)
         if pgn4 is not None:
             append_pgn4(pgn4, record, config, name1, name2)
-        if not args.quiet:
+        if config.sprt is not None and completed_pair and not args.quiet:
+            print_sprt_report(summary, config)
+            last_sprt_report = (
+                summary["games_completed"],
+                summary["pairs_completed"],
+                summary["sprt"]["state"],
+            )
+        elif config.sprt is None and not args.quiet:
             print_summary(summary, name1, name2, record)
 
-    interrupted = execute_tasks(
-        config,
-        tasks,
-        None,
-        continue_on_error=args.continue_on_error,
-        retries=args.retries,
-        on_record=on_record,
-    )
-    summary = stats.summary()
+    already_decided = stats.sprt is not None and stats.sprt.terminal
+    if already_decided:
+        interrupted = False
+    else:
+        interrupted = execute_tasks(
+            config,
+            tasks,
+            None,
+            continue_on_error=args.continue_on_error,
+            retries=args.retries,
+            on_record=on_record,
+            ordered=config.sprt is not None,
+            should_stop=(
+                (lambda: stats.sprt is not None and stats.sprt.terminal)
+                if config.sprt is not None
+                else None
+            ),
+        )
+    summary = stats.summary(final=not interrupted)
     summary["engine1_name"] = name1
     summary["engine2_name"] = name2
     if summary_path is not None:
         atomic_json(summary_path, summary)
+    if config.sprt is not None and summary["pairs_completed"]:
+        current_report = (
+            summary["games_completed"],
+            summary["pairs_completed"],
+            summary["sprt"]["state"],
+        )
+        if current_report != last_sprt_report:
+            print_sprt_report(summary, config)
+            last_sprt_report = current_report
     if interrupted:
-        print_final_summary(summary, name1, name2, interrupted=True)
+        if config.sprt is None:
+            print_final_summary(summary, name1, name2, interrupted=True)
         message = (
             "Completed games are saved and can be resumed."
             if out is not None
@@ -2481,7 +2919,8 @@ def run_match(args: argparse.Namespace) -> int:
             print(message, file=sys.stderr)
         return 130
 
-    print_final_summary(summary, name1, name2, interrupted=False)
+    if config.sprt is None:
+        print_final_summary(summary, name1, name2, interrupted=False)
     return 0
 
 
@@ -2511,6 +2950,35 @@ def build_parser() -> argparse.ArgumentParser:
     games = parser.add_mutually_exclusive_group()
     games.add_argument("--pairs", type=int, help="paired openings; two games each")
     games.add_argument("--games", type=int, help="total games")
+    parser.add_argument(
+        "--sprt",
+        action="store_true",
+        help="enable normalized-Elo SPRT; requires an explicit --pairs maximum",
+    )
+    parser.add_argument(
+        "--sprt-elo0",
+        type=float,
+        default=None,
+        help="SPRT rejection hypothesis in normalized Elo (default: 0)",
+    )
+    parser.add_argument(
+        "--sprt-elo1",
+        type=float,
+        default=None,
+        help="SPRT acceptance hypothesis in normalized Elo (default: 5)",
+    )
+    parser.add_argument(
+        "--sprt-alpha",
+        type=float,
+        default=None,
+        help="SPRT false-positive limit (default: 0.05)",
+    )
+    parser.add_argument(
+        "--sprt-beta",
+        type=float,
+        default=None,
+        help="SPRT false-negative limit (default: 0.05)",
+    )
     parser.add_argument(
         "--unpaired",
         action="store_true",
@@ -2628,6 +3096,15 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> int:
     parser = build_parser()
     args = parser.parse_args()
+    if args.sprt and args.pairs is None:
+        parser.error("--sprt requires an explicit --pairs maximum")
+    if not args.sprt and (
+        args.sprt_elo0 is not None
+        or args.sprt_elo1 is not None
+        or args.sprt_alpha is not None
+        or args.sprt_beta is not None
+    ):
+        parser.error("--sprt settings require --sprt")
     if args.games is not None:
         if args.games < 1:
             parser.error("--games must be at least 1")
@@ -2711,6 +3188,28 @@ def main() -> int:
         parser.error("--inc requires --tc")
     if not args.arbiter and (args.arbiter_options or args.arbiter_option):
         parser.error("--arbiter-options and --arbiter-option require --arbiter")
+    if args.sprt:
+        elo0 = 0.0 if args.sprt_elo0 is None else args.sprt_elo0
+        elo1 = 5.0 if args.sprt_elo1 is None else args.sprt_elo1
+        alpha = 0.05 if args.sprt_alpha is None else args.sprt_alpha
+        beta = 0.05 if args.sprt_beta is None else args.sprt_beta
+        if not math.isfinite(elo0) or not math.isfinite(elo1):
+            parser.error("--sprt bounds must be finite")
+        if elo0 >= elo1:
+            parser.error("--sprt ELO0 must be less than ELO1")
+        if not 0 < alpha < 1 or not 0 < beta < 1:
+            parser.error("--sprt-alpha and --sprt-beta must be between 0 and 1")
+        if alpha + beta >= 1:
+            parser.error("--sprt-alpha plus --sprt-beta must be less than 1")
+        if args.continue_on_error:
+            parser.error("--sprt cannot be combined with --continue-on-error")
+        if args.threads1 != args.threads2:
+            parser.error("--sprt requires equal --threads1 and --threads2")
+        if args.hash1 != args.hash2:
+            parser.error("--sprt requires equal --hash1 and --hash2")
+        args.sprt_config = SprtConfig(elo0, elo1, alpha, beta)
+    else:
+        args.sprt_config = None
     if args.fresh and not (args.out or args.pgn4 or args.nnue_output):
         parser.error("--fresh requires an output option")
     if not args.resume and not args.out:
