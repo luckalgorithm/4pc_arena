@@ -53,6 +53,9 @@ NNUE_GAME_TERMINATIONS = {
     "max_plies",
 }
 AUTO_NNUE_OUTPUT = "__auto_nnue_output__"
+NNUE_DATA_DEFAULT_GAMES = 50_000
+NNUE_DATA_DEFAULT_OPENING_PLIES = 12
+NNUE_DATA_DEFAULT_OPENING_NODES = 5_000
 
 # Reports engine startup, protocol, and rule-command failures.
 class EngineError(RuntimeError):
@@ -2959,6 +2962,69 @@ def run_match(args: argparse.Namespace) -> int:
     return 0
 
 
+# Runs a resumable NNUE corpus for every requested seed. The compact JSONL is
+# retained as the authoritative checkpoint so the derived text file can be
+# rebuilt without duplicate positions after an interruption.
+def run_nnue_data_seeds(args: argparse.Namespace) -> int:
+    seeds = list(args.nnue_data_seeds)
+    for position, seed in enumerate(seeds, 1):
+        seed_args = argparse.Namespace(**vars(args))
+        seed_args.seed = seed
+        seed_args.out = f"engine_seed_{seed}.jsonl"
+        seed_args.nnue_output = f"engine_seed_{seed}.txt"
+        print(
+            f"\nNNUE seed {seed} ({position}/{len(seeds)}): "
+            f"{seed_args.game_count:,} games -> {seed_args.nnue_output}",
+            flush=True,
+        )
+        result = run_match(seed_args)
+        if result:
+            return result
+    return 0
+
+
+# Returns whether an option was explicitly supplied, including --name=value.
+def cli_option_present(argv: list[str], *names: str) -> bool:
+    return any(
+        token == name or token.startswith(name + "=")
+        for token in argv
+        for name in names
+    )
+
+
+# Applies the NNUE generation profile while retaining explicit search/opening
+# overrides. Per-seed output paths are intentionally automatic and unambiguous.
+def apply_nnue_data_profile(
+    args: argparse.Namespace,
+    parser: argparse.ArgumentParser,
+    argv: list[str],
+) -> None:
+    if not args.nnue_data_seeds:
+        return
+    if len(set(args.nnue_data_seeds)) != len(args.nnue_data_seeds):
+        parser.error("--nnue-data-seeds cannot contain duplicate seeds")
+    if args.pairs is not None:
+        parser.error("--nnue-data-seeds cannot be combined with --pairs")
+    if args.sprt:
+        parser.error("--nnue-data-seeds cannot be combined with --sprt")
+    if args.out or args.nnue_output or args.pgn4:
+        parser.error(
+            "--nnue-data-seeds creates its own per-seed --out and "
+            "--nnue-output files"
+        )
+    if cli_option_present(argv, "--seed"):
+        parser.error("use --nnue-data-seeds instead of --seed in NNUE data mode")
+
+    if args.games is None:
+        args.games = NNUE_DATA_DEFAULT_GAMES
+    args.unpaired = True
+    args.training_output = True
+    if not cli_option_present(argv, "--opening-plies"):
+        args.opening_plies = NNUE_DATA_DEFAULT_OPENING_PLIES
+    if not cli_option_present(argv, "--opening-nodes"):
+        args.opening_nodes = NNUE_DATA_DEFAULT_OPENING_NODES
+
+
 # Defines the complete public command-line surface without performing I/O.
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
@@ -3072,6 +3138,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--fens", default="", help="opening FEN file")
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument(
+        "--nnue-data-seeds",
+        type=int,
+        nargs="+",
+        metavar="N",
+        default=None,
+        help=(
+            "generate one resumable NNUE corpus per seed; defaults to 50,000 "
+            "unpaired games, 10,000 nodes, 12 opening plies, 5,000 opening "
+            "nodes, and opening weights 60,30,10"
+        ),
+    )
+    parser.add_argument(
         "--out",
         default="",
         help="optional JSONL output path; enables persistence and resume",
@@ -3130,6 +3208,7 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> int:
     parser = build_parser()
     args = parser.parse_args()
+    apply_nnue_data_profile(args, parser, sys.argv[1:])
     if args.sprt and args.pairs is None:
         parser.error("--sprt requires an explicit --pairs maximum")
     if not args.sprt and (
@@ -3212,7 +3291,7 @@ def main() -> int:
         parser.error("--opening-max-score must be at least 0")
     if args.opening_attempts < 1:
         parser.error("--opening-attempts must be at least 1")
-    if args.training_output and not args.out:
+    if args.training_output and not (args.out or args.nnue_data_seeds):
         parser.error("--compact-output requires --out")
     if args.pgn4_single_line and not args.pgn4:
         parser.error("--pgn4-single-line requires --pgn4")
@@ -3244,16 +3323,22 @@ def main() -> int:
         args.sprt_config = SprtConfig(elo0, elo1, alpha, beta)
     else:
         args.sprt_config = None
-    if args.fresh and not (args.out or args.pgn4 or args.nnue_output):
+    if args.fresh and not (
+        args.out or args.pgn4 or args.nnue_output or args.nnue_data_seeds
+    ):
         parser.error("--fresh requires an output option")
-    if not args.resume and not args.out:
+    if not args.resume and not (args.out or args.nnue_data_seeds):
         parser.error("--no-resume requires --out")
     try:
-        return run_match(args)
+        return (
+            run_nnue_data_seeds(args)
+            if args.nnue_data_seeds
+            else run_match(args)
+        )
     except KeyboardInterrupt:
         message = (
             "Interrupted; completed games are saved and can be resumed."
-            if args.out
+            if args.out or args.nnue_data_seeds
             else "Interrupted."
         )
         print(message, file=sys.stderr)
