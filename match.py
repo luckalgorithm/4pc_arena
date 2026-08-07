@@ -43,12 +43,14 @@ FINAL_RESULTS = {"ry_win", "bg_win", "draw"}
 NORMALIZED_ELO_SCALE = 800 / math.log(10)
 NORMAL_95_Z = 1.959963984540054
 SPRT_REPORT_SEPARATOR = "----------------------------------------------"
-# Only rule-derived endings are reliable training labels. Infrastructure
-# failures and artificial move limits must not enter the NNUE corpus.
+# Rule-derived and draw-adjudicated endings are reliable training labels.
+# Infrastructure failures must not enter the NNUE corpus.
 NNUE_GAME_TERMINATIONS = {
     "game_result",
     "engine_reported_result",
     "no_legal_moves_result",
+    "no_legal_moves",
+    "max_plies",
 }
 AUTO_NNUE_OUTPUT = "__auto_nnue_output__"
 
@@ -416,7 +418,13 @@ class SummaryAccumulator:
     # Incorporates one Engine 1-oriented record. The first half of a pair waits
     # in pending_pairs until its color-swapped partner arrives.
     def add(self, record: dict[str, Any]) -> None:
-        score = float(record.get("engine1_score", 0.5))
+        result = effective_game_result(record)
+        engine1_team = str(record.get("engine1_team", ""))
+        score = (
+            engine1_score(result, engine1_team)
+            if result in FINAL_RESULTS and engine1_team in {"ry", "bg"}
+            else float(record.get("engine1_score", 0.5))
+        )
         self.games_completed += 1
         if score == 1.0:
             self.engine1_wins += 1
@@ -1345,6 +1353,34 @@ def mate_score_result(info: dict[str, Any], team: str) -> str | None:
         return None
     return winner_for_failure(team) if value <= 0 else f"{team}_win"
 
+
+# A move searched as mate in one is authoritative when the resulting position
+# returns no move but an older engine cannot report the terminal game result.
+def previous_mate_result(searches: Any) -> str | None:
+    if not isinstance(searches, list) or not searches:
+        return None
+    previous = searches[-1]
+    if not isinstance(previous, dict):
+        return None
+    team = previous.get("team")
+    score = previous.get("score")
+    if team not in {"ry", "bg"} or not isinstance(score, dict):
+        return None
+    try:
+        mate = int(score["value"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    return f"{team}_win" if score.get("type") == "mate" and mate == 1 else None
+
+
+# Corrects legacy records written before mate-in-one no-move endings were
+# distinguished from genuine stalemates. New records already store this result.
+def effective_game_result(record: dict[str, Any]) -> str:
+    result = str(record.get("result", ""))
+    if result == "draw" and record.get("termination") == "no_legal_moves":
+        return previous_mate_result(record.get("searches")) or result
+    return result
+
 # Finalizes the mutable game record in one place so every termination includes
 # the same moves, score, and four-color clock snapshot.
 def finish_game(
@@ -1526,6 +1562,7 @@ def play_game(
                 result = confirm_no_legal_moves(
                     other_engine, moves, task.start.fen, search, team, config.timeout
                 )
+                result = result or previous_mate_result(searches)
                 return finish_game(
                     record, result or "draw",
                     "no_legal_moves_result" if result else "no_legal_moves",
@@ -1684,11 +1721,7 @@ def sprt_info(summary: dict[str, Any]) -> str | None:
         if first or second:
             parts.append(f"[{label}: {first} / {second}]")
     terminations = summary["terminations"]
-    scalar_counts = (
-        ("No legal moves", "no_legal_moves"),
-        ("Max plies", "max_plies"),
-        ("Runner errors", "runner_error"),
-    )
+    scalar_counts = (("Runner errors", "runner_error"),)
     for label, key in scalar_counts:
         count = int(terminations.get(key, 0))
         if count:
@@ -1897,11 +1930,11 @@ def compact_training_record(record: dict[str, Any]) -> dict[str, Any]:
     return compact
 
 # Renders position samples from the side-to-move team's perspective. Technical
-# and artificial endings are excluded because they are unreliable game labels.
+# endings are excluded because they are unreliable game labels.
 def nnue_lines(record: dict[str, Any]) -> list[str]:
     if record.get("termination") not in NNUE_GAME_TERMINATIONS:
         return []
-    game_result = str(record.get("result", ""))
+    game_result = effective_game_result(record)
     lines: list[str] = []
     for search in record.get("searches", []):
         if not isinstance(search, dict):
@@ -1999,6 +2032,8 @@ def pgn4_result(result: str) -> str:
 # Produces an explanatory Termination tag only for exceptional endings.
 def pgn4_termination(record: dict[str, Any]) -> str | None:
     termination = str(record.get("termination", ""))
+    if termination == "no_legal_moves" and effective_game_result(record) != "draw":
+        return None
     labels = {
         "max_plies": "Draw due to max moves reached",
         "no_legal_moves": "Draw due to no legal moves",
@@ -2017,7 +2052,7 @@ def pgn4_termination(record: dict[str, Any]) -> str | None:
 # Selects the Chess.com move-list marker for draws, time losses, and ordinary
 # decisive endings. Technical errors are not mislabeled as checkmate.
 def pgn4_terminal_marker(record: dict[str, Any]) -> str | None:
-    result = str(record.get("result", ""))
+    result = effective_game_result(record)
     termination = str(record.get("termination", ""))
     if result == "draw":
         return "D" if termination == "max_plies" else "S"
@@ -2051,7 +2086,7 @@ def serialize_pgn4_game(
     engine2_name: str,
 ) -> str:
     red_name, blue_name = pgn4_engine_names(record, engine1_name, engine2_name)
-    result = pgn4_result(str(record.get("result", "")))
+    result = pgn4_result(effective_game_result(record))
     lines = [
         '[Variant "Teams"]',
         '[RuleVariants "EnPassant"]',
