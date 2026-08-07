@@ -18,7 +18,7 @@ import subprocess
 import sys
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from collections.abc import Iterable, Iterator
 from datetime import date
 from pathlib import Path
@@ -133,6 +133,7 @@ class MatchConfig:
     pgn4_single_line: bool = False
     nnue_output: bool = False
     sprt: SprtConfig | None = None
+    nnue_opening_fallback: bool = False
 
 # Captures the final response to one UCI search, including protocol-level game
 # completion or position-rejection details when no move is returned.
@@ -1300,6 +1301,26 @@ def generate_start(
 
         if not rejected:
             return StartPosition(fen, moves, "fen" if fen else "startpos")
+
+    if (
+        config.nnue_opening_fallback
+        and config.opening_nodes > 0
+        and config.opening_max_score > 0
+    ):
+        print(
+            "Warning: could not generate a balanced opening after "
+            f"{attempts} attempts; accepting the next valid guided opening "
+            "without a score cutoff for NNUE generation.",
+            file=sys.stderr,
+            flush=True,
+        )
+        return generate_start(
+            replace(config, opening_max_score=0),
+            rng,
+            fen,
+            opening_engine,
+            rules_engine,
+        )
 
     raise EngineError(
         "Could not generate a balanced opening after "
@@ -2683,6 +2704,7 @@ def run_match(args: argparse.Namespace) -> int:
                         pgn4_single_line=args.pgn4_single_line,
                         nnue_output=nnue_output is not None,
                         sprt=args.sprt_config,
+                        nnue_opening_fallback=bool(args.nnue_data_seeds),
     )
     validate_sprt_config(config, continue_on_error=args.continue_on_error)
     if arbiter is not None:
