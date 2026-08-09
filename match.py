@@ -1340,8 +1340,8 @@ def go_command(config: MatchConfig, clocks: dict[str, int]) -> str:
             f"{UCI_CLOCK_PREFIX[color]}inc {config.increment_ms}"
             for color in TURN_ORDER
         )
-        return f"go {times} {increments}"
-    return f"go {config.limit_kind} {config.limit_value}"
+        return f"go {times} {increments} silent"
+    return f"go {config.limit_kind} {config.limit_value} silent"
 
 # Gives clock searches the active color's remaining time plus the configured
 # response grace. Fixed-limit searches use the response timeout directly.
