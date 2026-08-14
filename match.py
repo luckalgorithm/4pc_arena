@@ -889,6 +889,20 @@ class UciEngine:
                 continue
             if line.startswith("info string Game completed."):
                 return []
+            if line.startswith("info string"):
+                lowered = line.lower()
+                if any(
+                    phrase in lowered
+                    for phrase in (
+                        "invalid fen",
+                        "invalid position",
+                        "illegal fen",
+                        "illegal position",
+                        "illegal move",
+                        "invalid move",
+                    )
+                ):
+                    return []
             if line.startswith("info "):
                 parsed = parse_info(line)
                 pv_index = int(parsed.get("multipv", 1))
@@ -1253,12 +1267,17 @@ def generate_start(
                 rejected = True
                 break
 
-            ranked = opening_engine.search_multipv(
-                moves,
-                fen,
-                f"go nodes {config.opening_nodes}",
-                config.timeout,
-            )
+            try:
+                ranked = opening_engine.search_multipv(
+                    moves,
+                    fen,
+                    f"go nodes {config.opening_nodes}",
+                    config.timeout,
+                )
+            except (TimeoutError, EngineError):
+                rejected = True
+                break
+
             if not ranked:
                 rejected = True
                 break
@@ -1308,15 +1327,18 @@ def generate_start(
             and config.opening_max_score > 0
             and len(moves) == config.opening_plies
         ):
-            final_ranked = opening_engine.search_multipv(
-                moves,
-                fen,
-                f"go nodes {config.opening_nodes}",
-                config.timeout,
-            )
-            rejected = not final_ranked or opening_score_is_extreme(
-                final_ranked[0].info, config.opening_max_score
-            )
+            try:
+                final_ranked = opening_engine.search_multipv(
+                    moves,
+                    fen,
+                    f"go nodes {config.opening_nodes}",
+                    config.timeout,
+                )
+                rejected = not final_ranked or opening_score_is_extreme(
+                    final_ranked[0].info, config.opening_max_score
+                )
+            except (TimeoutError, EngineError):
+                rejected = True
 
         if not rejected:
             return StartPosition(fen, moves, "fen" if fen else "startpos")
