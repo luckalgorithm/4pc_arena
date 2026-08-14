@@ -1275,6 +1275,11 @@ def generate_start(
                     config.timeout,
                 )
             except (TimeoutError, EngineError):
+                # Flush delayed output (like a stale bestmove) to prevent UCI desync
+                try:
+                    opening_engine.sync()
+                except (TimeoutError, EngineError):
+                    pass
                 rejected = True
                 break
 
@@ -1338,6 +1343,11 @@ def generate_start(
                     final_ranked[0].info, config.opening_max_score
                 )
             except (TimeoutError, EngineError):
+                # Flush delayed output (like a stale bestmove) to prevent UCI desync
+                try:
+                    opening_engine.sync()
+                except (TimeoutError, EngineError):
+                    pass
                 rejected = True
 
         if not rejected:
