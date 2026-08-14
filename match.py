@@ -1213,8 +1213,7 @@ def opening_score_is_extreme(info: dict[str, Any], max_score: int) -> bool:
         return False
 
 # Generates one shared start position. Uniform mode samples legal moves; guided
-# mode samples weighted MultiPV ranks and retries openings whose final score is
-# too extreme.
+# mode samples weighted MultiPV ranks with candidate filtering and backtracking.
 def generate_start(
     config: MatchConfig,
     rng: random.Random,
@@ -1225,6 +1224,7 @@ def generate_start(
     if config.opening_plies <= 0:
         moves: list[str] = []
         return StartPosition(fen, moves, "fen" if fen else "startpos")
+
     if opening_engine is None:
         opening_config = config.arbiter or config.engine1
         if config.opening_nodes > 0:
@@ -1235,9 +1235,10 @@ def generate_start(
             return generate_start(config, rng, fen, owned)
 
     attempts = config.opening_attempts if config.opening_nodes > 0 else 1
-    for _ in range(attempts):
-        moves = []
+    for _attempt in range(attempts):
+        moves: list[str] = []
         rejected = False
+
         for _ply in range(config.opening_plies):
             if config.opening_nodes <= 0:
                 rules = rules_engine or opening_engine
@@ -1251,6 +1252,7 @@ def generate_start(
             if legal == []:
                 rejected = True
                 break
+
             ranked = opening_engine.search_multipv(
                 moves,
                 fen,
@@ -1260,6 +1262,8 @@ def generate_start(
             if not ranked:
                 rejected = True
                 break
+
+            # If even the best move (PV 1) exceeds max_score, this branch is unbalanced
             if opening_score_is_extreme(ranked[0].info, config.opening_max_score):
                 rejected = True
                 break
@@ -1267,7 +1271,9 @@ def generate_start(
             legal_set = set(legal) if legal is not None else None
             candidates: list[str] = []
             weights: list[float] = []
-            for rank, result in enumerate(ranked[:len(config.opening_weights)]):
+
+            # 1. Filter candidates: Only keep moves whose individual score is within max_score
+            for rank, result in enumerate(ranked[: len(config.opening_weights)]):
                 move = result.bestmove
                 if (
                     move is None
@@ -1275,14 +1281,27 @@ def generate_start(
                     or move in candidates
                 ):
                     continue
+
+                # Reject candidate moves that would unbalance the game
+                if opening_score_is_extreme(result.info, config.opening_max_score):
+                    continue
+
                 candidates.append(move)
                 weights.append(config.opening_weights[rank])
+
+            # 2. Fallback: If all sub-PV moves were filtered out, fallback to PV 1 (the best move)
             if not candidates:
-                raise EngineError(
-                    f"{opening_engine.label} returned no legal MultiPV opening move"
-                )
+                best = ranked[0].bestmove
+                if best is not None and (legal_set is None or best in legal_set):
+                    candidates.append(best)
+                    weights.append(1.0)
+                else:
+                    rejected = True
+                    break
+
             moves.append(rng.choices(candidates, weights=weights, k=1)[0])
 
+        # 3. Final balance check
         if (
             not rejected
             and config.opening_nodes > 0
@@ -1323,9 +1342,9 @@ def generate_start(
         )
 
     raise EngineError(
-        "Could not generate a balanced opening after "
-        f"{attempts} attempts; increase --opening-max-score, provide more FENs, "
-        "or increase --opening-attempts"
+        f"Could not generate a balanced opening after {attempts} attempts; "
+        "increase --opening-max-score, provide more balanced FENs, "
+        "or increase --opening-attempts."
     )
 
 # Builds either a fixed-limit search or a four-color clock search. Every color
