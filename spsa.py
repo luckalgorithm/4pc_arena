@@ -5,6 +5,7 @@ import argparse
 import json
 import math
 import random
+import signal
 import sys
 import time
 from dataclasses import asdict, dataclass
@@ -15,9 +16,11 @@ from match import (
     EngineConfig,
     EngineError,
     MatchConfig,
+    UciEngine,
     load_fens,
     load_options,
     play_match,
+    validate_engine,
 )
 
 
@@ -26,6 +29,9 @@ DEFAULT_GAMMA = 0.101
 MAX_HISTORY_ENTRIES = 5000
 PARAMETER_HISTORY_INTERVAL = 100
 MAX_PARAMETER_HISTORY_ENTRIES = 500
+# Batches in a row where every game was a runner error before giving up. A
+# broken engine or machine would otherwise burn the whole run on no-op updates.
+MAX_FAILED_BATCHES = 5
 
 
 @dataclass
@@ -522,6 +528,87 @@ def export_state(args: argparse.Namespace) -> int:
         )
     return 0
 
+# Stops the run cleanly on SIGTERM/SIGHUP (kill, logout, closed ssh session)
+# the same way as Ctrl-C: the batch in flight is discarded and the state file
+# keeps the last completed update.
+def install_stop_handlers() -> None:
+    def stop(signum: int, _frame: Any) -> None:
+        raise KeyboardInterrupt(f"signal {signum}")
+
+    for name in ("SIGTERM", "SIGHUP"):
+        sig = getattr(signal, name, None)
+        if sig is not None:
+            signal.signal(sig, stop)
+    # Shells start background jobs (`spsa.py ... &` in a script) with SIGINT
+    # ignored, which would make `kill -INT` a no-op.
+    signal.signal(signal.SIGINT, signal.default_int_handler)
+
+# A resumed run must use the same schedule, or c/a and the flip sequence no
+# longer match what produced the saved thetas.
+def check_resume_compatible(
+    state: dict[str, Any],
+    args: argparse.Namespace,
+    params: list[Parameter],
+) -> None:
+    if not state:
+        return
+    mismatches = []
+    for key, current in (
+        ("iterations", args.iterations),
+        ("seed", args.seed),
+        ("A", args.a),
+        ("alpha", args.alpha),
+        ("gamma", args.gamma),
+    ):
+        saved = state.get(key)
+        if saved is not None and not math.isclose(float(saved), float(current)):
+            mismatches.append(f"{key}: state {saved}, args {current}")
+    saved_names = [str(param.get("name")) for param in state.get("parameters", [])]
+    current_names = [param.name for param in params]
+    if saved_names and saved_names != current_names:
+        added = sorted(set(current_names) - set(saved_names))
+        removed = sorted(set(saved_names) - set(current_names))
+        detail = []
+        if added:
+            detail.append("added " + ", ".join(added))
+        if removed:
+            detail.append("removed " + ", ".join(removed))
+        mismatches.append("parameters: " + ("; ".join(detail) or "order changed"))
+    if mismatches:
+        raise ValueError(
+            f"{args.state} was made with different settings ("
+            + "; ".join(mismatches)
+            + "). Use a new --state file, or --no-resume to start over."
+        )
+
+# Checks the parameter file against the engine once, before any games, so a
+# typo or out-of-range value fails now instead of an hour into the run.
+def check_engine_parameters(args: argparse.Namespace, params: list[Parameter]) -> None:
+    engine = EngineConfig(Path(args.engine).resolve(), {}, args.hash, args.threads)
+    validate_engine(engine, "Engine")
+    with UciEngine(engine, label="Engine") as probe:
+        options = {name.casefold(): option for name, option in probe.uci_options.items()}
+    problems = []
+    for param in params:
+        option = options.get(param.name.casefold())
+        if option is None:
+            problems.append(f"{param.name}: engine has no such UCI option")
+            continue
+        if option.type != "spin":
+            problems.append(f"{param.name}: UCI option is {option.type}, not spin")
+            continue
+        if option.min is not None and param.minimum < option.min:
+            problems.append(f"{param.name}: min {param.minimum:g} < engine min {option.min}")
+        if option.max is not None and param.maximum > option.max:
+            problems.append(f"{param.name}: max {param.maximum:g} > engine max {option.max}")
+        if param.c_end < 0.5:
+            problems.append(
+                f"{param.name}: c_end {param.c_end:g} rounds both sides to the "
+                "same integer late in the run; use at least 0.5"
+            )
+    if problems:
+        raise ValueError("Parameter file does not match the engine:\n  " + "\n  ".join(problems))
+
 
 def build_match_config(
     args: argparse.Namespace,
@@ -581,6 +668,15 @@ def run_spsa(args: argparse.Namespace) -> int:
     )
     state_path = Path(args.state)
     state = load_state(state_path) if args.resume else {}
+    check_resume_compatible(state, args, params)
+    check_engine_parameters(args, params)
+    if args.pairs * 2 < args.workers:
+        print(
+            f"warning: --pairs {args.pairs} gives {args.pairs * 2} games per update, "
+            f"so only that many of the {args.workers} workers are used",
+            file=sys.stderr,
+            flush=True,
+        )
     updates_completed, history, parameter_history = compact_state_history(state)
     start_iteration = restore_parameters(params, state)
     if start_iteration >= args.iterations:
@@ -598,6 +694,7 @@ def run_spsa(args: argparse.Namespace) -> int:
     )
 
     iteration = start_iteration
+    failed_batches = 0
     while iteration < args.iterations:
         batch_pairs = min(args.pairs, args.iterations - iteration)
         steps = make_steps(
@@ -621,15 +718,42 @@ def run_spsa(args: argparse.Namespace) -> int:
             seed=args.seed + iteration,
             continue_on_error=args.continue_on_error,
         )
+        # A partial batch would apply a gradient from a handful of games and
+        # still count all of its pairs, so drop it and stop. The flips drawn for
+        # it are replayed on resume since updates_completed is unchanged.
+        if match_result.interrupted:
+            raise KeyboardInterrupt
         summary = match_result.summary
-        result = result_from_summary(summary)
-        update_parameters(params, steps, result)
-        iteration += batch_pairs
         updates_completed += 1
+        failed = (
+            summary["games_completed"] == 0
+            or summary["runner_errors"] >= summary["games_completed"]
+        )
+        if failed:
+            # Nothing was learned: keep theta and the schedule position, and
+            # retry this iteration with the next flips.
+            failed_batches += 1
+            print(
+                f"[{iteration}/{args.iterations}] every game was a runner error "
+                f"({failed_batches}/{MAX_FAILED_BATCHES} in a row); update skipped",
+                file=sys.stderr,
+                flush=True,
+            )
+            if failed_batches >= MAX_FAILED_BATCHES:
+                raise EngineError(
+                    f"{MAX_FAILED_BATCHES} batches in a row had only runner errors; "
+                    "check the engine and machine"
+                )
+            result = 0
+        else:
+            failed_batches = 0
+            result = result_from_summary(summary)
+            update_parameters(params, steps, result)
+            iteration += batch_pairs
 
         entry = {
             "iteration": iteration,
-            "pairs": batch_pairs,
+            "pairs": 0 if failed else batch_pairs,
             "result": result,
             "summary": summary,
         }
@@ -664,6 +788,8 @@ def run_spsa(args: argparse.Namespace) -> int:
         }
         write_state(state_path, state)
 
+        if failed:
+            continue
         if iteration % args.progress_interval == 0 or iteration == args.iterations:
             print(
                 f"[{iteration}/{args.iterations}] {summarize_step(summary)} "
@@ -815,6 +941,7 @@ def main() -> int:
 
     parser = build_tune_parser()
     args = parser.parse_args()
+    install_stop_handlers()
     try:
         normalize_args(args)
         return run_spsa(args)
